@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">屏知 ScreenIQ</string>
+    <string name="accessibility_description">屏知读屏服务：在后台读取当前屏幕上的文字，识别成题目后给出解答并以悬浮窗显示。只读文字，不上传屏幕内容；自动点击选项需你在 App 内单独开启。仅用于个人备考自测。</string>
+    <string name="notification_channel">屏知读屏服务</string>
 </resources>
