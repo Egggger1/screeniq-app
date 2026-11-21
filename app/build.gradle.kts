@@ -11,8 +11,8 @@ android {
         applicationId = "com.screeniq.app"
         minSdk = 23          // 覆盖 Android 6.0+，荣耀绝大多数机型
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1-原型"
+        versionCode = 2
+        versionName = "0.2-自动识屏"
     }
 
     buildTypes {
