@@ -5,12 +5,51 @@ import androidx.core.content.edit
 
 /** 配置存储：模型与密钥只存本机 SharedPreferences，不上传、不联网回传。 */
 class ConfigStore(context: Context) {
+    private val appContext = context.applicationContext
     private val sp = context.getSharedPreferences("screeniq_config", Context.MODE_PRIVATE)
+
+    companion object {
+        const val ACTION_LOG = "com.screeniq.LOG_CHANGED"
+    }
+
+    private fun notifyLogChanged() {
+        appContext.sendBroadcast(android.content.Intent(ACTION_LOG).setPackage(appContext.packageName))
+    }
 
     fun provider(): String = sp.getString("provider", "deepseek") ?: "deepseek"
     fun apiKey(): String = sp.getString("api_key", "") ?: ""
     fun baseUrl(): String = sp.getString("base_url", "") ?: ""
     fun model(): String = sp.getString("model", "") ?: ""
+
+    // ===== 后台识屏开关（全部默认关闭，用户手动开启 = opt-in）=====
+    /** 后台自动识屏总开关：无障碍服务是否真正去读屏并答题 */
+    fun autoRead(): Boolean = sp.getBoolean("auto_read", false)
+    fun setAutoRead(v: Boolean) = sp.edit { putBoolean("auto_read", v) }
+
+    /** 自动操控：找到答案后是否自动点击选项/填入。默认关，需单独显式开启 */
+    fun autoAction(): Boolean = sp.getBoolean("auto_action", false)
+    fun setAutoAction(v: Boolean) = sp.edit { putBoolean("auto_action", v) }
+
+    /** 悬浮窗显示答案；关闭时降级为通知 */
+    fun overlay(): Boolean = sp.getBoolean("overlay", true)
+    fun setOverlay(v: Boolean) = sp.edit { putBoolean("overlay", v) }
+
+    /** 详细解释开关，答题服务要用 */
+    fun explain(): Boolean = sp.getBoolean("explain", true)
+    fun setExplain(v: Boolean) = sp.edit { putBoolean("explain", v) }
+
+    /** 读屏日志（诊断用，最近若干条），只存文字摘要不存屏幕内容全文 */
+    fun log(): String = sp.getString("read_log", "") ?: ""
+    fun appendLog(line: String) {
+        val existing = log().lines().takeLast(30).toMutableList()
+        existing.add(line)
+        sp.edit { putString("read_log", existing.takeLast(30).joinToString("\n")) }
+        notifyLogChanged()
+    }
+    fun clearLog() {
+        sp.edit { putString("read_log", "") }
+        notifyLogChanged()
+    }
 
     fun save(provider: String, apiKey: String, baseUrl: String, model: String) {
         sp.edit {
@@ -33,6 +72,10 @@ class ConfigStore(context: Context) {
             put("api_key_masked", masked)
             put("base_url", baseUrl())
             put("model", model())
+            put("auto_read", autoRead())
+            put("auto_action", autoAction())
+            put("overlay", overlay())
+            put("explain", explain())
         }
     }
 }
