@@ -24,7 +24,7 @@
   --ease:cubic-bezier(.2,.8,.2,1);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--safe-top:0px}
+:root{--safe-top:0px;--tabs-h:0px}
 html,body{height:100%;width:100%;max-width:100%;overflow-x:hidden}
 body{
   font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;
@@ -42,7 +42,7 @@ header{
   background:var(--surf);
   border-bottom:1px solid color-mix(in srgb, var(--outline) 18%, transparent);
 }
-.brand{display:flex;align-items:center;gap:11px}
+.brand{display:flex;align-items:center;gap:11px;flex:0 0 auto}
 .brand-mark{
   width:38px;height:38px;border-radius:13px;display:flex;align-items:center;justify-content:center;
   background:linear-gradient(145deg,var(--p),var(--s)); color:var(--op);
@@ -53,25 +53,25 @@ header{
 .brand-sub{font-size:10.5px;color:var(--onVar);letter-spacing:2px;margin-top:1px}
 .spacer{flex:1}
 .chip{
-  display:flex;align-items:center;gap:8px;cursor:pointer;
+  display:flex;align-items:center;gap:8px;cursor:pointer;flex-shrink:0;white-space:nowrap;max-width:170px;
   background:var(--sc2);border:1px solid color-mix(in srgb,var(--outline) 25%,transparent);
   color:var(--on);border-radius:999px;padding:9px 16px;font-size:13px;transition:.2s var(--ease);
 }
 .chip:hover{background:var(--sc3);transform:translateY(-1px)}
 .chip .icon{width:17px;height:17px;color:var(--p)}
-.chip b{font-weight:700;color:var(--p)}
+.chip b{font-weight:700;color:var(--p);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
 .icon-btn{
-  width:42px;height:42px;border-radius:14px;border:none;cursor:pointer;
+  width:42px;height:42px;flex-shrink:0;border-radius:14px;border:none;cursor:pointer;
   background:var(--sc2);color:var(--onVar);display:flex;align-items:center;justify-content:center;
   transition:.2s var(--ease);
 }
 .icon-btn:hover{background:var(--sc3);color:var(--p);transform:rotate(20deg)}
 
-/* 手机端模式切换条（侧栏隐藏后用这个） */
-.mobile-tabs{display:none;gap:8px;padding:10px 16px;background:var(--surf);border-bottom:1px solid color-mix(in srgb,var(--outline) 15%,transparent)}
+/* 手机端模式切换条：必须固定定位，不能参与 body 的 flex 布局，否则会把整页撑爆 */
+.mobile-tabs{display:none;gap:8px;padding:8px 12px;background:var(--surf);border-bottom:1px solid color-mix(in srgb,var(--outline) 15%,transparent);position:fixed;left:0;right:0;top:calc(68px + var(--safe-top));height:60px;z-index:4;box-sizing:border-box}
 .mobile-tabs .mt{
-  flex:1;display:flex;align-items:center;justify-content:center;gap:7px;
-  padding:10px 8px;border-radius:999px;cursor:pointer;font-size:13px;font-weight:600;
+  flex:1;min-width:0;display:flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap;
+  padding:0 8px;border-radius:999px;cursor:pointer;font-size:13px;font-weight:600;
   color:var(--onVar);background:var(--sc1);border:1px solid transparent;transition:.2s var(--ease);
 }
 .mobile-tabs .mt .icon{width:17px;height:17px}
@@ -293,17 +293,34 @@ select:focus,input:focus{border-color:var(--p)}
 ::-webkit-scrollbar{width:9px}
 ::-webkit-scrollbar-thumb{background:var(--sc3);border-radius:9px;border:2px solid var(--surfLow)}
 @media(max-width:760px){
+  :root{--tabs-h:60px}
   nav{display:none}
   .mobile-tabs{display:flex!important}
+  /* 正文顶部要同时避开顶栏和切换条 */
+  .app{padding-top:calc(68px + var(--tabs-h) + var(--safe-top))}
   .toolrow .tip{display:none}
-  header{padding-left:16px;padding-right:16px;gap:9px}
-  .brand-name{font-size:17px}
-  .brand-sub{font-size:9px;letter-spacing:1.4px}
-  .chip{padding:8px 11px;font-size:11.5px}
-  .chip .icon{width:14px;height:14px}
-  .icon-btn{width:38px;height:38px}
-  .chat{padding:20px 16px}
+  header{padding-left:14px;padding-right:14px;gap:8px}
+  .brand{gap:8px}
+  .brand-mark{width:34px;height:34px;border-radius:11px}
+  .brand-name{font-size:16px}
+  .brand-sub{font-size:8px;letter-spacing:1px}
+  .chip{padding:8px 10px;font-size:11px;max-width:112px}
+  .chip b{max-width:80px}
+  .chip .icon{width:13px;height:13px}
+  .icon-btn{width:36px;height:36px;border-radius:12px}
+  .chat{padding:18px 14px}
   .mbody{max-width:100%}
+  .hero h1{font-size:25px}
+  .hero p{font-size:12.5px}
+  .hero-art{width:108px;height:108px;margin-bottom:18px}
+  .hero-eye .icon{width:50px;height:50px}
+  .quick{gap:8px}
+  .quick button{padding:10px 13px;font-size:11.5px}
+  .dock{padding:10px 12px 18px}
+  textarea{font-size:16px}
+  .inputbar{padding:6px 6px 6px 8px}
+  .ib-btn{width:38px;height:38px;flex-basis:38px}
+  .send{width:40px;height:40px;flex-basis:40px}
 }
 @media(min-width:761px){.mobile-tabs{display:none!important}}
 </style>
@@ -348,8 +365,8 @@ select:focus,input:focus{border-color:var(--p)}
 </header>
 
 <div class="mobile-tabs">
-  <div class="mt active" id="mtOcr" onclick="setMode('ocr')"><svg class="icon"><use href="#i-scan"/></svg>识屏答题</div>
-  <div class="mt" id="mtChat" onclick="setMode('chat')"><svg class="icon"><use href="#i-chat"/></svg>自由聊天</div>
+  <div class="mt active" id="mtOcr" onclick="onTabOcr()"><svg class="icon"><use href="#i-scan"/></svg>识屏答题</div>
+  <div class="mt" id="mtChat" onclick="onTabChat()"><svg class="icon"><use href="#i-chat"/></svg>自由聊天</div>
 </div>
 
 <div class="app">
@@ -536,6 +553,18 @@ function onProviderChange(){
   if(!p) return;
   document.getElementById('providerNote').textContent=p.note;
   document.getElementById('getKey').innerHTML=`没有密钥？<a href="${p.get_key_url}" target="_blank">去这里免费申请 →</a>`;
+}
+/* 手机上点「识屏答题」直接唤起选图，让这个按钮有看得见的反馈；
+   桌面版侧栏仍只切换模式，保持原来的行为。 */
+function onTabOcr(){
+  setMode('ocr');
+  if(window.__screeniq){
+    try{ document.getElementById('fileInput').click(); }catch(e){}
+  }
+}
+function onTabChat(){
+  setMode('chat');
+  try{ document.getElementById('question').focus(); }catch(e){}
 }
 function setMode(m){
   mode=m;
