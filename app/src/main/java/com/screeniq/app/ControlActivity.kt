@@ -35,6 +35,7 @@ class ControlActivity : AppCompatActivity() {
     private lateinit var swExplain: Switch
     private lateinit var tvLog: TextView
     private lateinit var logScroll: ScrollView
+    private lateinit var tvGuide: TextView
     private var initializing = true   // 抑制初始化时开关回调
 
     private val stateReceiver = object : BroadcastReceiver() {
@@ -136,6 +137,22 @@ class ControlActivity : AppCompatActivity() {
         }
         root.addView(btnRow, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 24 })
 
+        // ---- 下一步引导卡（把权限→开关→切后台串起来）----
+        tvGuide = TextView(this).apply {
+            textSize = 13f
+            setLineSpacing(5f, 1.25f)
+            setTextColor(android.graphics.Color.parseColor("#FFD98F"))
+            setPadding(24, 20, 24, 20)
+        }
+        val guideCard = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setBackgroundColor(android.graphics.Color.parseColor("#1F3A35"))
+            addView(tvGuide)
+        }
+        root.addView(guideCard, android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 18 })
+
         // ---- 四个开关 ----
         swRead = makeSwitch(root, "自动识屏（后台读题并作答）")
         swOverlay = makeSwitch(root, "悬浮窗就地显示答案")
@@ -148,6 +165,7 @@ class ControlActivity : AppCompatActivity() {
             if (v && !isServiceEnabled()) {
                 Toast.makeText(this, "请先点上面的「开启读屏权限」", Toast.LENGTH_LONG).show()
             }
+            refreshGuide()
         }
         swOverlay.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
@@ -157,11 +175,13 @@ class ControlActivity : AppCompatActivity() {
                 return@setOnCheckedChangeListener
             }
             cfg.setOverlay(v)
+            refreshGuide()
         }
         swAction.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
             cfg.setAutoAction(v)
             if (v) Toast.makeText(this, "自动操控已开启：会尝试自动点选答案。只在自己练习时使用。", Toast.LENGTH_LONG).show()
+            refreshGuide()
         }
         swExplain.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
@@ -247,6 +267,45 @@ class ControlActivity : AppCompatActivity() {
         val ov = Settings.canDrawOverlays(this)
         tvOverlay.text = if (ov) "● 悬浮窗权限：已开启" else "○ 悬浮窗权限：未开启（点下方按钮）"
         tvOverlay.setTextColor(android.graphics.Color.parseColor(if (ov) "#5DCAA5" else "#FFD98F"))
+        refreshGuide()
+    }
+
+    /** 动态引导：明确告诉用户「现在到第几步、接下来做什么」，把权限→开关→切后台串成一条线。 */
+    @SuppressLint("SetTextI18n")
+    private fun refreshGuide() {
+        val readOn = isServiceEnabled()
+        val ovOn = Settings.canDrawOverlays(this)
+        val autoRead = cfg.autoRead()
+        val text: String
+        val color: String
+        when {
+            !readOn && !ovOn -> {
+                text = "第 1 步：点上面两个按钮，把「读屏权限」和「悬浮窗权限」都打开。\n" +
+                       "读屏权限在系统设置页里找到「屏知 ScreenIQ」打开；两个都变绿后继续。"
+                color = "#FFD98F"
+            }
+            !readOn -> {
+                text = "还差读屏权限：点「① 开启读屏权限」，在系统设置里找到「屏知 ScreenIQ」打开。\n" +
+                       "回来后这里会自动变绿。"
+                color = "#FFD98F"
+            }
+            !ovOn -> {
+                text = "还差悬浮窗权限：点「② 开启悬浮窗权限」并允许。\n" +
+                       "这个权限让答案能浮在题目上方。"
+                color = "#FFD98F"
+            }
+            !autoRead -> {
+                text = "✓ 两个权限都好了。现在把下面「自动识屏」开关打开，就算全部就绪。"
+                color = "#8FD8FF"
+            }
+            else -> {
+                text = "✓✓ 全部就绪！现在直接切到你的题库 App 就行——\n" +
+                       "这个界面可以放后台、也可以划掉关掉。切过去后答案会自动浮出来，日志会记在这里。"
+                color = "#5DCAA5"
+            }
+        }
+        tvGuide.text = text
+        tvGuide.setTextColor(android.graphics.Color.parseColor(color))
     }
 
     private fun refreshLog() {
