@@ -24,20 +24,22 @@
   --ease:cubic-bezier(.2,.8,.2,1);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
+:root{--safe-top:0px}
+html,body{height:100%;width:100%;max-width:100%;overflow-x:hidden}
 body{
   font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;
   background:var(--surfLow); color:var(--on); height:100vh;
   display:flex; overflow:hidden; -webkit-font-smoothing:antialiased;
+  overscroll-behavior:none;touch-action:pan-y;
 }
 .icon{width:22px;height:22px;flex:0 0 auto}
 
 /* ---------- 顶栏 ---------- */
 header{
-  position:fixed; top:0; left:0; right:0; height:68px; z-index:5;
-  display:flex; align-items:center; gap:14px; padding:0 24px;
-  background:color-mix(in srgb, var(--surf) 88%, transparent);
-  backdrop-filter:blur(20px);
+  position:fixed; top:0; left:0; right:0; z-index:5;
+  height:calc(68px + var(--safe-top)); padding:var(--safe-top) 24px 0;
+  display:flex; align-items:center; gap:14px;
+  background:var(--surf);
   border-bottom:1px solid color-mix(in srgb, var(--outline) 18%, transparent);
 }
 .brand{display:flex;align-items:center;gap:11px}
@@ -65,8 +67,18 @@ header{
 }
 .icon-btn:hover{background:var(--sc3);color:var(--p);transform:rotate(20deg)}
 
+/* 手机端模式切换条（侧栏隐藏后用这个） */
+.mobile-tabs{display:none;gap:8px;padding:10px 16px;background:var(--surf);border-bottom:1px solid color-mix(in srgb,var(--outline) 15%,transparent)}
+.mobile-tabs .mt{
+  flex:1;display:flex;align-items:center;justify-content:center;gap:7px;
+  padding:10px 8px;border-radius:999px;cursor:pointer;font-size:13px;font-weight:600;
+  color:var(--onVar);background:var(--sc1);border:1px solid transparent;transition:.2s var(--ease);
+}
+.mobile-tabs .mt .icon{width:17px;height:17px}
+.mobile-tabs .mt.active{background:var(--sc2);color:var(--p);border-color:color-mix(in srgb,var(--p) 30%,transparent)}
+
 /* ---------- 主体 ---------- */
-.app{display:flex;flex:1;padding-top:68px;min-height:0}
+.app{display:flex;flex:1;padding-top:calc(68px + var(--safe-top));min-height:0}
 nav{
   width:248px;flex:0 0 248px;background:var(--surf);
   border-right:1px solid color-mix(in srgb,var(--outline) 15%,transparent);
@@ -281,12 +293,19 @@ select:focus,input:focus{border-color:var(--p)}
 ::-webkit-scrollbar{width:9px}
 ::-webkit-scrollbar-thumb{background:var(--sc3);border-radius:9px;border:2px solid var(--surfLow)}
 @media(max-width:760px){
-  nav{width:72px;flex-basis:72px;padding:18px 10px}
-  .nav-item span.txt,.nav-label,.side-card{display:none}
-  .nav-item{justify-content:center;padding:14px}
-  .nav-item.active::before{left:-10px}
+  nav{display:none}
+  .mobile-tabs{display:flex!important}
   .toolrow .tip{display:none}
+  header{padding-left:16px;padding-right:16px;gap:9px}
+  .brand-name{font-size:17px}
+  .brand-sub{font-size:9px;letter-spacing:1.4px}
+  .chip{padding:8px 11px;font-size:11.5px}
+  .chip .icon{width:14px;height:14px}
+  .icon-btn{width:38px;height:38px}
+  .chat{padding:20px 16px}
+  .mbody{max-width:100%}
 }
+@media(min-width:761px){.mobile-tabs{display:none!important}}
 </style>
 </head>
 <body>
@@ -328,6 +347,11 @@ select:focus,input:focus{border-color:var(--p)}
   <button class="icon-btn" onclick="openSettings()" title="设置"><svg class="icon"><use href="#i-settings"/></svg></button>
 </header>
 
+<div class="mobile-tabs">
+  <div class="mt active" id="mtOcr" onclick="setMode('ocr')"><svg class="icon"><use href="#i-scan"/></svg>识屏答题</div>
+  <div class="mt" id="mtChat" onclick="setMode('chat')"><svg class="icon"><use href="#i-chat"/></svg>自由聊天</div>
+</div>
+
 <div class="app">
   <nav>
     <div class="nav-item active" id="tabOcr" onclick="setMode('ocr')">
@@ -344,7 +368,7 @@ select:focus,input:focus{border-color:var(--p)}
     <div class="side-card">
       <div class="tag">◈ 为备考而生</div>
       <h4>拍下题目，就地解答</h4>
-      <p>备考刷题、执法考试、专业课难题——不用截屏切来切去，答案就在眼前。</p>
+      <p>备考刷题、执法考试、专业课难题——传图即读，答案就在眼前。</p>
     </div>
   </nav>
 
@@ -357,7 +381,7 @@ select:focus,input:focus{border-color:var(--p)}
             <div class="hero-eye"><svg class="icon"><use href="#i-scan"/></svg></div>
           </div>
           <h1>你好，我是 <span>屏知</span></h1>
-          <p id="heroDesc">把屏幕上看到的题目拍给我，我读出文字、给出解答。<br>不用截屏、不用切来切去，答案就在眼前。</p>
+          <p id="heroDesc">把题目截图传给我，我读出文字、给出解答。<br>答案就在眼前，备考刷题不用反复切换。</p>
           <div class="quick">
             <button onclick="quickAsk('upload')">📷 上传题目图片</button>
             <button onclick="quickAsk('1+1等于几？')">试试问一道题</button>
@@ -517,9 +541,11 @@ function setMode(m){
   mode=m;
   document.getElementById('tabOcr').classList.toggle('active',m==='ocr');
   document.getElementById('tabChat').classList.toggle('active',m==='chat');
+  document.getElementById('mtOcr').classList.toggle('active',m==='ocr');
+  document.getElementById('mtChat').classList.toggle('active',m==='chat');
   const hint=document.getElementById('hint');
   if(m==='ocr'){
-    document.getElementById('heroDesc').innerHTML='把屏幕上看到的题目拍给我，我读出文字、给出解答。<br>不用截屏、不用切来切去，答案就在眼前。';
+    document.getElementById('heroDesc').innerHTML='把题目截图传给我，我读出文字、给出解答。<br>答案就在眼前，备考刷题不用反复切换。';
     hint.textContent='识屏答题模式：上传图片会自动识字；也可直接打字提问';
     document.getElementById('question').placeholder='输入问题，或上传题目截图后直接点发送…';
   }else{
