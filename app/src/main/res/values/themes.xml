@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色主题，跟网页界面风格一致；全面屏 -->
+    <style name="Theme.ScreenIQ" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#0D1B19</item>
+        <item name="android:navigationBarColor">#091312</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowBackground">#091312</item>
+        <item name="android:windowFullscreen">false</item>
+    </style>
+</resources>
