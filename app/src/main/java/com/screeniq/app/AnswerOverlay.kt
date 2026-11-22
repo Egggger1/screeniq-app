@@ -256,6 +256,21 @@ object AnswerOverlay {
         }
     }
 
+    /** 卡片当前占的屏幕区域。自动点选前用它判断"目标是不是被自己挡住了"。 */
+    fun cardBounds(): android.graphics.Rect? {
+        val h = host ?: return null
+        if (card?.visibility != View.VISIBLE) return null
+        val loc = IntArray(2)
+        runCatching { h.getLocationOnScreen(loc) }
+        if (h.width <= 0 || h.height <= 0) return null
+        return android.graphics.Rect(loc[0], loc[1], loc[0] + h.width, loc[1] + h.height)
+    }
+
+    /** 立刻收成小胶囊（自动点选前腾开遮挡用）。 */
+    fun collapseNow() {
+        main.post { collapse() }
+    }
+
     private fun stripMd(s: String): String = s
         .replace("**", "")
         .replace("__", "")

@@ -645,13 +645,28 @@ class ScreenReadService : AccessibilityService() {
         val r = Rect()
         runCatching { n.getBoundsInScreen(r) }
         if (r.width() <= 0 || r.height() <= 0) return false
-        val path = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
+        val cx = r.exactCenterX()
+        val cy = r.exactCenterY()
+
+        // 目标正好在我们的答案卡下面：手势会戳到卡片自己，先收卡再点
+        val card = AnswerOverlay.cardBounds()
+        if (card != null && card.contains(cx.toInt(), cy.toInt())) {
+            cfg.appendLog("[操控] 目标被答案卡遮住，先收卡再点")
+            AnswerOverlay.collapseNow()
+            main.postDelayed({ doGesture(cx, cy) }, 220L)
+            return true
+        }
+        return doGesture(cx, cy)
+    }
+
+    private fun doGesture(x: Float, y: Float): Boolean {
+        val path = Path().apply { moveTo(x, y) }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0L, 80L))
             .build()
         val ok = runCatching { dispatchGesture(gesture, null, null) }.getOrDefault(false)
         cfg.appendLog(
-            if (ok) "[操控] 手势点击 (${r.centerX()}, ${r.centerY()})"
+            if (ok) "[操控] 手势点击 (${x.toInt()}, ${y.toInt()})"
             else "[操控] 手势注入被系统拒绝"
         )
         return ok
