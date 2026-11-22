@@ -50,9 +50,12 @@ import kotlin.math.abs
  *  D. 截图与视觉调用解耦：截图/识别每轮都可做（便宜），视觉调用才限流（贵）。
  *
  * ── 自动操控 ─────────────────────────────────────────────────
- * 答案一到就自己点。定位顺序：模型给的编号(Set-of-Mark) → 节点精确 → 识别精确
- * → 识别包含 → 节点包含 → 模型坐标。点完会再截一屏确认页面真的变了，
- * 没变会原地补点一次；页面在回答期间已经变了（你手快自己点了）则直接放弃，绝不乱点。
+ * 答案一到就自己点。定位顺序：模型从可点清单挑的编号(E) → 模型给的截图编号(Set-of-Mark)
+ * → 节点精确 → 识别精确 → 包含匹配 → 字母 → 模型坐标。
+ * 点完会再截一屏确认页面真的变了；没变先在**同一个点**补一次（不改选择），
+ * 仍不动才换下一个落点（最多 3 个）。同一屏连着两次都推不动就熔断，
+ * 免得反复乱戳、也免得一直重复问模型。答完会顺手按掉「下一题/继续/知道了」。
+ * 页面在回答期间已经变了（你手快自己点了）则直接放弃，绝不乱点。
  */
 class ScreenReadService : AccessibilityService() {
 
@@ -87,6 +90,31 @@ class ScreenReadService : AccessibilityService() {
     private var lastPx = -1f
     private var lastPy = -1f
     private var lastChoice = 0
+    private var lastNodeNo = 0
+
+    /**
+     * 当前屏幕上的可点控件清单（E1、E2…），和截图一起交给模型。
+     *
+     * 为什么要有它：光靠"识别出的文字行"定位，遇到原生控件（按钮的文字在节点里、
+     * 但截图里被图标挡住/字号太小认不出）就会瞎。反过来只靠节点又点不到 Canvas。
+     * 两条通道各给一套编号，模型指哪条我们就走哪条——这是 OpenCyvis / AppAgent
+     * 那一派 a11y 树 + 截图双模态的简化版。
+     */
+    private var lastUiElements: List<UiElement> = emptyList()
+
+    /**
+     * 上面这份清单属于哪一屏（存指纹）。
+     *
+     * 必须记这个：答案出来到真正点选之间有 0.8 秒，期间巡检可能又读了一次屏，
+     * 把清单换成了新一屏的元素。此时模型给的 E3 指向的已经不是它看到的那个按钮了，
+     * 照着点就会点错。指纹对不上就放弃编号这条路，退回按文字匹配。
+     */
+    private var elementsFp = ""
+
+    /** 熔断：同一屏连续点不动几次就停手，免得反复乱戳、也免得白花 token。 */
+    private var failFp = ""
+    private var failStreak = 0
+    private val deadFps = HashSet<String>()
 
     /** 出答案那一屏的"选项词集合"，用来判断回答期间题有没有被换掉。 */
     private var lastOptionKeys: Set<String> = emptySet()
@@ -250,6 +278,13 @@ class ScreenReadService : AccessibilityService() {
         lastAttemptAt = 0
         lastClickedFp = ""
         lastOcrLines = emptyList()
+        lastUiElements = emptyList()
+        lastNodeNo = 0
+        elementsFp = ""
+        // 用户手动重来 = 明确表示"再试一次"，熔断要跟着清掉
+        failFp = ""
+        failStreak = 0
+        deadFps.clear()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -429,6 +464,10 @@ class ScreenReadService : AccessibilityService() {
             }
             text = text.trim()
 
+            // 可点控件清单：这一屏能点的按钮/选项先编好号（E1、E2…），随题目一起交给模型。
+            // 放这么早是因为后面判题、点选都可能用到；成本只是一次树遍历（几十毫秒）。
+            lastUiElements = runCatching { collectUiElements(root) }.getOrDefault(emptyList())
+
             // --- 文字太少：有截图就继续（题可能全是图），没截图才等渲染 ---
             if (text.length < MIN_TEXT_LEN && shot == null) {
                 if (!manual && retryLater(allowOcr, attempt)) return
@@ -441,6 +480,7 @@ class ScreenReadService : AccessibilityService() {
 
             // --- 内容没变，跳过（指纹 = 全文哈希 + 识别行数 + 像素签名）---
             val fp = fingerprint(text, lines, sig)
+            elementsFp = fp
             if (fp == lastFingerprint && !manual) {
                 // 页面可能只是动画/光标在动：放慢一点再来看，别每 1.2 秒都做一次识别
                 lastAskAt = System.currentTimeMillis() + 800
@@ -491,7 +531,9 @@ class ScreenReadService : AccessibilityService() {
                 }
             }
 
-            val question = buildQuestion(text, imageMode = shotB64 != null, numbered = lines)
+            val question = buildQuestion(
+                text, imageMode = shotB64 != null, numbered = lines, elements = lastUiElements
+            )
             cfg.appendLog("[读题·$source] ${text.take(110).replace('\n', ' ')}")
 
             if (!manual) {
@@ -551,16 +593,20 @@ class ScreenReadService : AccessibilityService() {
                 }
                 else -> {
                     cfg.appendLog("[答案] ${stripMd(answer).take(120).replace('\n', ' ')}")
-                    if (result.choice > 0) cfg.appendLog("[答案] 模型指向编号 ${result.choice}")
+                    if (result.choice > 0) cfg.appendLog("[答案] 模型指向截图编号 ${result.choice}")
+                    if (result.nodeNo > 0) cfg.appendLog("[答案] 模型指向控件 E${result.nodeNo}")
                     lastFingerprint = fp
                     lastAskAt = System.currentTimeMillis()
                     lastPx = result.px
                     lastPy = result.py
                     lastChoice = result.choice
+                    lastNodeNo = result.nodeNo
                     lastOptionKeys = runCatching { optionKeys(root) }.getOrDefault(emptySet())
                     withContext(Dispatchers.Main) {
                         showAnswer(answer)
-                        scheduleAutoClick(answer, fp, result.choice, result.px, result.py)
+                        scheduleAutoClick(
+                            answer, fp, result.choice, result.px, result.py, result.nodeNo
+                        )
                     }
                 }
             }
@@ -594,19 +640,30 @@ class ScreenReadService : AccessibilityService() {
      * 点之前先确认"题还没被换掉"，点之后再截一屏确认"页面真的变了"。
      */
     private fun scheduleAutoClick(
-        answer: String, fp: String, choice: Int, px: Float, py: Float
+        answer: String, fp: String, choice: Int, px: Float, py: Float, nodeNo: Int
     ) {
         if (!cfg.autoAction()) return
         if (fp == lastClickedFp) return
+        if (fp in deadFps) {
+            cfg.appendLog("[操控] 这题之前点不动，已停手（点悬浮球可手动重试）")
+            return
+        }
         cfg.appendLog("[操控] 自动作答已开，准备点选…")
         main.postDelayed({
             scope.launch {
-                val msg = runCatching { performAct(answer, choice, px, py) }
+                val msg = runCatching { performAct(answer, fp, choice, px, py, nodeNo) }
                     .getOrElse { "点选异常：${it.javaClass.simpleName}" }
                 if (msg.startsWith("已点选")) {
                     lastClickedFp = fp
                     // 点完页面通常有奖励动画，别在这 1.2 秒里把同一题再问一遍
                     lastAskAt = System.currentTimeMillis() + 1200
+                    // 答完顺手把「下一题/继续/知道了」按掉：这类按钮是确定性的，
+                    // 交给脚本而不是再问一次模型（晨钟酱那套"手归脚本、脑归模型"的分工）。
+                    val adv = runCatching { tryAdvance(answer) }.getOrNull()
+                    if (adv != null) {
+                        cfg.appendLog("[推进] 顺手点了「$adv」，接着看下一题")
+                        lastAskAt = System.currentTimeMillis() + 1600
+                    }
                 } else {
                     lastAskAt = System.currentTimeMillis() + 2500
                 }
@@ -623,7 +680,7 @@ class ScreenReadService : AccessibilityService() {
      * 照着旧坐标戳下去极可能点错选项——宁可这次不点，也不能乱点。
      */
     private suspend fun performAct(
-        answer: String, choice: Int, px: Float, py: Float
+        answer: String, fp: String, choice: Int, px: Float, py: Float, nodeNo: Int
     ): String {
         if (!cfg.autoAction()) return "自动作答未开"
         // Android 11 以下没有无障碍截图接口，也就没法做"点完再确认"
@@ -636,17 +693,17 @@ class ScreenReadService : AccessibilityService() {
             return "页面已变，本次不自动点"
         }
 
-        val target = resolveTarget(answer, choice, px, py)
-            ?: return "没找到「${stripMd(answer).take(12)}」可点的位置"
+        val ladder = resolveLadder(answer, nodeNo, choice, px, py, fp)
+        if (ladder.isEmpty()) return "没找到「${stripMd(answer).take(12)}」可点的位置"
 
         // 目标被答案窗挡住 → 先收卡；收完仍挡着（正好压在收起后的小胶囊上）就临时撤掉
         var card = AnswerOverlay.cardBounds()
-        if (card != null && card.contains(target.x.toInt(), target.y.toInt())) {
+        if (card != null && ladder.any { card!!.contains(it.x.toInt(), it.y.toInt()) }) {
             cfg.appendLog("[操控] 目标被答案窗遮住，先让开")
             withContext(Dispatchers.Main) { AnswerOverlay.collapseNow() }
             delay(300)
             card = AnswerOverlay.cardBounds()
-            if (card != null && card.contains(target.x.toInt(), target.y.toInt())) {
+            if (card != null && ladder.any { card!!.contains(it.x.toInt(), it.y.toInt()) }) {
                 withContext(Dispatchers.Main) { AnswerOverlay.hide() }
                 delay(280)
             }
@@ -656,27 +713,54 @@ class ScreenReadService : AccessibilityService() {
         val sigBefore = before?.let { ScreenshotOcr.signature(it, ownOverlayRects(it)) } ?: ""
         before?.recycle()
 
-        val ok = tapTarget(target)
-        if (!ok) {
-            cfg.appendLog("[操控] 点击注入失败：${target.label}")
-            return "点选失败（系统拒绝了手势）"
+        // 阶梯重试：先点最可信的落点，两次都推不动页面才换下一个策略。
+        // 注意"同点补点"在前、"换目标"在后 —— 换目标有选错答案的风险，
+        // 所以只有在页面真的一动不动（连选中高亮都没有）时才允许换。
+        var hit: TapTarget? = null
+        for ((idx, target) in ladder.withIndex()) {
+            if (idx > 0) {
+                if (pageChangedSinceAnswer()) {
+                    cfg.appendLog("[操控] 换策略前发现页面已变，停止（避免点错）")
+                    break
+                }
+                cfg.appendLog("[操控] 第 $idx 个落点没反应，换「${target.label.take(14)}」再试")
+                delay(220)
+            }
+            if (!tapTarget(target)) {
+                cfg.appendLog("[操控] 落点注入失败：${target.label}")
+                continue
+            }
+            cfg.appendLog("[操控] 已点选：${target.label} @ (${target.x.toInt()}, ${target.y.toInt()})")
+
+            delay(TAP_VERIFY_DELAY_MS)
+            var changed = screenChanged(sigBefore)
+
+            // 同一个点再戳一次：不改变选择，只是有些 H5 控件要两次真实触摸才响应
+            if (!changed) {
+                cfg.appendLog("[操控] 页面没变化，改用真实触摸原地补点")
+                tapAt(target.x, target.y)
+                delay(700)
+                changed = screenChanged(sigBefore)
+            }
+            if (changed) {
+                hit = target
+                break
+            }
         }
-        cfg.appendLog("[操控] 已点选：${target.label} @ (${target.x.toInt()}, ${target.y.toInt()})")
 
-        delay(TAP_VERIFY_DELAY_MS)
-        var changed = screenChanged(sigBefore)
-
-        // 没变化就原地补一次：**同一个点**再戳一下，不会误点到别的选项。
-        // 这里强制走手势——有些 H5 控件 performAction 会返回 true 但其实什么都没发生。
-        if (!changed) {
-            cfg.appendLog("[操控] 页面没变化，改用真实触摸原地补点")
-            tapAt(target.x, target.y)
-            delay(700)
-            changed = screenChanged(sigBefore)
+        hit?.let {
+            failStreak = 0
+            return "已点选：${it.label}"
         }
 
-        return if (changed) "已点选：${target.label}"
-        else "已点选：${target.label}（页面没变化，可能只需选中后手动提交）"
+        // 所有落点都推不动 → 熔断这一屏，免得反复乱戳、也免得一直重复问模型
+        if (fp == failFp) failStreak++ else { failFp = fp; failStreak = 1 }
+        if (failStreak >= 2) {
+            deadFps.add(fp)
+            cfg.appendLog("[操控] 这一屏连点 $failStreak 次没反应，已停手")
+            return "这题点不动，已停手"
+        }
+        return "试了 ${ladder.size} 个落点，页面没变化"
     }
 
     /** 截一屏和基准比，判断页面到底动没动。 */
@@ -718,7 +802,7 @@ class ScreenReadService : AccessibilityService() {
 
     /** 浮窗上「自动点选此答案」按钮走这条：同步点一下，把结论回显到标题。 */
     private fun quickTap(answer: String): String {
-        val target = resolveTarget(answer, lastChoice, lastPx, lastPy)
+        val target = resolveTarget(answer, lastChoice, lastPx, lastPy, lastNodeNo)
             ?: return "没找到可点的位置"
         val ok = tapTarget(target)
         return if (ok) "已点选：${target.label}" else "点选失败"
@@ -733,82 +817,223 @@ class ScreenReadService : AccessibilityService() {
     )
 
     /**
-     * 定位顺序，从准到糙：
-     *  1. 模型给的编号（Set-of-Mark，最准：直接落到识别框中心）
-     *  2. 无障碍节点精确匹配（原生控件，performAction 最可靠）
+     * 屏幕上一个"可点的东西"：节点树里能点的控件，编成 E1、E2…
+     * 只带中心点不够——节点点击要用本体，所以 node 一直留着。
+     */
+    private class UiElement(
+        val no: Int,
+        val label: String,
+        val x: Float,
+        val y: Float,
+        val node: AccessibilityNodeInfo?
+    )
+
+    /**
+     * 收集当前屏幕的可点控件。
+     *
+     * 只收"有短文字、在屏幕上、够大"的节点，最多 28 个：给模型的清单越长越吵，
+     * 还会挤占 token。自己铺的悬浮窗要剔掉，否则模型可能指着一个我们自己的按钮。
+     * 节点自己不可点就往上找一层可点的祖先——H5 里"文字不可点、容器可点"很常见。
+     */
+    private fun collectUiElements(root: AccessibilityNodeInfo?): List<UiElement> {
+        if (root == null) return emptyList()
+        val dm = resources.displayMetrics
+        val out = ArrayList<UiElement>(24)
+        val seen = HashSet<String>()
+        val minW = (30 * dm.density).toInt()
+        val minH = (20 * dm.density).toInt()
+        val card = AnswerOverlay.cardBounds()
+        val bubble = ControlBubble.bounds()
+
+        fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+            if (n == null || depth > 26 || out.size >= 28) return
+            val label = runCatching {
+                n.text?.toString()?.trim().orEmpty().ifBlank {
+                    n.contentDescription?.toString()?.trim().orEmpty()
+                }
+            }.getOrDefault("").replace(Regex("[\\s\\u3000]+"), " ")
+
+            if (label.isNotEmpty() && label.length <= 24) {
+                val r = Rect()
+                if (runCatching { n.getBoundsInScreen(r) }.isSuccess &&
+                    r.width() >= minW && r.height() >= minH
+                ) {
+                    val cx = r.exactCenterX()
+                    val cy = r.exactCenterY()
+                    val hitOwn = (card != null && card.contains(cx.toInt(), cy.toInt())) ||
+                            (bubble != null && bubble.contains(cx.toInt(), cy.toInt()))
+                    val key = "$label@${(cx / 16).toInt()},${(cy / 16).toInt()}"
+                    if (!hitOwn && seen.add(key)) {
+                        val clickable = if (n.isClickable) n
+                        else runCatching { n.parent }.getOrNull()?.takeIf { it.isClickable }
+                        out.add(UiElement(out.size + 1, label, cx, cy, clickable ?: n))
+                    }
+                }
+            }
+            for (i in 0 until n.childCount) {
+                walk(runCatching { n.getChild(i) }.getOrNull(), depth + 1)
+            }
+        }
+        walk(root, 0)
+        return out
+    }
+
+    /** 答完题后常见的推进按钮：确定性的活儿交给脚本，不必再问一次模型。 */
+    private val ADVANCE_WORDS = listOf(
+        "下一题", "下一关", "继续答题", "继续", "再来一题", "再来一次",
+        "我知道了", "知道了", "开心收下", "领取奖励", "领取", "确定", "好的"
+    )
+
+    /**
+     * 答对之后把「下一题 / 继续 / 知道了」按掉一次。
+     *
+     * 为什么值得单独写：活动答题页每答一题都会弹一个奖励层，不点掉就永远停在那一屏，
+     * 表现成"识别到题、也点中了，但就是不动了"。这类按钮文字是固定的，
+     * 用白名单直接点比再花一次模型调用稳得多，也快得多。
+     * 只点一次、且答案本身不是这个词，避免连环误点。
+     */
+    private suspend fun tryAdvance(answer: String): String? {
+        delay(850)   // 等奖励弹窗/动效真正出来
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return null
+        var found: AccessibilityNodeInfo? = null
+        var label = ""
+
+        fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+            if (n == null || depth > 30 || found != null) return
+            val t = runCatching {
+                n.text?.toString()?.trim().orEmpty().ifBlank {
+                    n.contentDescription?.toString()?.trim().orEmpty()
+                }
+            }.getOrDefault("")
+            if (t.isNotEmpty() && t.length <= 8 && t in ADVANCE_WORDS && isOnScreen(n)) {
+                val clickable = if (n.isClickable) n
+                else runCatching { n.parent }.getOrNull()?.takeIf { it.isClickable }
+                found = clickable ?: n
+                label = t
+                return
+            }
+            for (i in 0 until n.childCount) {
+                walk(runCatching { n.getChild(i) }.getOrNull(), depth + 1)
+            }
+        }
+        walk(root, 0)
+
+        val node = found ?: return null
+        // 答案本身就叫「确定」这种极端情况：别把选项当推进按钮
+        if (candidates(answer).any { normalize(it) == normalize(label) }) return null
+
+        val ok = if (node.isClickable) clickNode(node) else tapByGesture(node)
+        return if (ok) label else null
+    }
+
+    /**
+     * 候选落点，从准到糙排好（返回前 3 个，供"点不动就换一个"用）：
+     *  0. 模型从可点控件清单里挑的 E 编号（控件本体，热区最准）
+     *  1. 截图圆牌编号（Set-of-Mark，落到识别框中心）
+     *  2. 无障碍节点精确匹配（原生控件）
      *  3. 识别文字精确匹配（画上去的选项）
-     *  4. 识别文字包含匹配
-     *  5. 节点包含匹配
+     *  4. 识别/节点包含匹配
+     *  5. 选项字母（"选 B"）
      *  6. 模型给的相对坐标（最后兜底）
      */
-    private fun resolveTarget(answer: String, choice: Int, px: Float, py: Float): TapTarget? {
-        val cands = candidates(answer)
+    private fun resolveLadder(
+        answer: String, nodeNo: Int, choice: Int, px: Float, py: Float, fp: String = ""
+    ): List<TapTarget> {
+        val out = ArrayList<TapTarget>(4)
+        fun add(t: TapTarget?) {
+            if (t == null || out.size >= 3) return
+            if (out.any { abs(it.x - t.x) < 6f && abs(it.y - t.y) < 6f }) return
+            out.add(t)
+        }
+        // 编号只在"还是同一屏"时才作数，否则指的可能是新一屏的元素
+        val sameScreen = fp.isEmpty() || fp == elementsFp
 
-        // 1. 编号
-        if (choice in 1..lastOcrLines.size) {
+        // 0. 控件编号
+        if (sameScreen && nodeNo in 1..lastUiElements.size) {
+            val e = lastUiElements[nodeNo - 1]
+            cfg.appendLog("[操控] 按控件编号 E${e.no} →「${e.label.take(14)}」")
+            add(TapTarget("E${e.no} ${e.label}", e.x, e.y, e.node))
+        }
+
+        // 1. 截图圆牌编号
+        if (sameScreen && choice in 1..lastOcrLines.size) {
             val line = lastOcrLines[choice - 1]
-            val pt = imageToScreen(line.cx, line.cy) ?: return null
-            cfg.appendLog("[操控] 按编号 $choice →「${line.text}」")
-            return TapTarget(line.text, pt.first, pt.second)
+            imageToScreen(line.cx, line.cy)?.let {
+                cfg.appendLog("[操控] 按截图编号 $choice →「${line.text.take(14)}」")
+                add(TapTarget(line.text, it.first, it.second))
+            }
         }
 
         val root = runCatching { rootInActiveWindow }.getOrNull() ?: pendingRoot
+        val cands = candidates(answer)
 
         // 2. 节点精确 / 3. 识别精确
         for (c in cands) {
+            if (out.size >= 3) break
             if (root != null) {
-                findOptionNode(root, c, exactOnly = true)?.let { n ->
+                val n = findOptionNode(root, c, exactOnly = true)
+                if (n != null) {
                     val r = Rect()
                     if (runCatching { n.getBoundsInScreen(r) }.isSuccess && r.width() > 0) {
-                        return TapTarget(c, r.exactCenterX(), r.exactCenterY(), n)
+                        add(TapTarget(c, r.exactCenterX(), r.exactCenterY(), n))
                     }
                 }
             }
-            findOcrLine(c, exactOnly = true)?.let { line ->
-                val pt = imageToScreen(line.cx, line.cy) ?: return@let
-                return TapTarget(line.text, pt.first, pt.second)
+            val line = findOcrLine(c, exactOnly = true)
+            if (line != null) {
+                imageToScreen(line.cx, line.cy)?.let { add(TapTarget(line.text, it.first, it.second)) }
             }
         }
 
-        // 4. 识别包含 / 5. 节点包含（只在自动作答开启时才会走到这里）
+        // 4. 识别包含 / 节点包含
         for (c in cands) {
-            findOcrLine(c, exactOnly = false)?.let { line ->
-                val pt = imageToScreen(line.cx, line.cy) ?: return@let
-                return TapTarget(line.text, pt.first, pt.second)
+            if (out.size >= 3) break
+            val line = findOcrLine(c, exactOnly = false)
+            if (line != null) {
+                imageToScreen(line.cx, line.cy)?.let { add(TapTarget(line.text, it.first, it.second)) }
             }
             if (root != null) {
-                findOptionNode(root, c, exactOnly = false)?.let { n ->
+                val n = findOptionNode(root, c, exactOnly = false)
+                if (n != null) {
                     val r = Rect()
                     if (runCatching { n.getBoundsInScreen(r) }.isSuccess && r.width() > 0) {
-                        return TapTarget(c, r.exactCenterX(), r.exactCenterY(), n)
+                        add(TapTarget(c, r.exactCenterX(), r.exactCenterY(), n))
                     }
                 }
             }
         }
 
-        // 6. 字母兜底（"选 B" 这类），节点与识别两条路都试
+        // 5. 字母兜底（"选 B" 这类）
         optionLetter(answer)?.let { letter ->
             if (root != null) {
-                findLetterOption(root, letter)?.let { n ->
+                val n = findLetterOption(root, letter)
+                if (n != null) {
                     val r = Rect()
                     if (runCatching { n.getBoundsInScreen(r) }.isSuccess && r.width() > 0) {
-                        return TapTarget("选项 $letter", r.exactCenterX(), r.exactCenterY(), n)
+                        add(TapTarget("选项 $letter", r.exactCenterX(), r.exactCenterY(), n))
                     }
                 }
             }
-            findOcrLetter(letter)?.let { line ->
-                val pt = imageToScreen(line.cx, line.cy) ?: return@let
-                return TapTarget(line.text, pt.first, pt.second)
+            val line = findOcrLetter(letter)
+            if (line != null) {
+                imageToScreen(line.cx, line.cy)?.let {
+                    add(TapTarget(line.text, it.first, it.second))
+                }
             }
         }
 
-        // 7. 模型坐标
+        // 6. 模型坐标
         if (px in 0f..1f && py in 0f..1f) {
             val dm = resources.displayMetrics
-            return TapTarget("模型坐标", px * dm.widthPixels, py * dm.heightPixels)
+            add(TapTarget("模型坐标", px * dm.widthPixels, py * dm.heightPixels))
         }
-        return null
+        return out
     }
+
+    /** 只要一个落点时用这个（浮窗上手动点选）。 */
+    private fun resolveTarget(
+        answer: String, choice: Int, px: Float, py: Float, nodeNo: Int = 0
+    ): TapTarget? = resolveLadder(answer, nodeNo, choice, px, py, lastFingerprint).firstOrNull()
 
     private fun tapTarget(t: TapTarget): Boolean =
         if (t.node != null) clickNode(t.node) else tapAt(t.x, t.y)
@@ -1217,7 +1442,8 @@ class ScreenReadService : AccessibilityService() {
     private fun buildQuestion(
         screen: String,
         imageMode: Boolean = false,
-        numbered: List<OcrLine> = emptyList()
+        numbered: List<OcrLine> = emptyList(),
+        elements: List<UiElement> = emptyList()
     ): String {
         val cleaned = screen.lineSequence()
             .map { it.trim() }
@@ -1230,6 +1456,12 @@ class ScreenReadService : AccessibilityService() {
             "\n截图上的文字按编号如下（编号 = 图上的小圆牌）：\n" +
                 numbered.take(24).mapIndexed { i, l -> "${i + 1}. ${l.text.take(40)}" }
                     .joinToString("\n").take(800) + "\n"
+        } else ""
+
+        val elementPart = if (elements.isNotEmpty()) {
+            "\n屏幕上可点的控件清单（编号只用来指路，不要出现在答案里）：\n" +
+                elements.take(20).joinToString("\n") { "E${it.no} ${it.label.take(24)}" }
+                    .take(700) + "\n"
         } else ""
 
         val extraRule = when {
@@ -1247,6 +1479,11 @@ class ScreenReadService : AccessibilityService() {
                 "4. 如果是看图猜字、认字读音类题目而文字里没有那个字，就直接回复：需要看图\n"
         }
 
+        val elementRule = if (elements.isNotEmpty())
+            "6. 如果答案就是上面「可点控件清单」里某一项（例如某个按钮写着答案），" +
+                "最后单独一行写 CLICK:E编号（例如 CLICK:E3）。清单里没有对应项就别写。\n"
+        else ""
+
         val body = if (cleaned.isBlank() && imageMode)
             "（这一屏几乎没有文字，题目和选项都画在图上，请看截图）" else cleaned
 
@@ -1257,7 +1494,9 @@ class ScreenReadService : AccessibilityService() {
                 "灯谜、谜语、脑筋急转弯的谜底通常就是其中一个选项，请直接写出那个选项的文字。\n" +
                 "3. 如果题目信息不足、无法确定答案，回复：信息不足\n" +
                 extraRule +
+                elementRule +
                 listPart +
+                elementPart +
                 "屏幕文字如下：\n" +
                 "------\n$body\n------"
     }

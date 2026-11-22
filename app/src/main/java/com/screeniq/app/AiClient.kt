@@ -15,6 +15,9 @@ import java.util.concurrent.TimeUnit
  *              没有就是 -1 —— 调用方据此决定走节点点击还是坐标点击。
  * @param choice 看图时模型选的编号（截图上的 Set-of-Mark 小圆牌）。
  *               0 表示没有。有它时优先按"编号对应的文字框"点，比坐标准得多。
+ * @param nodeNo 模型从「可点控件清单」里挑的 E 编号（E3 → 3）。
+ *               这是比 choice 更硬的一条线索：它指向的是真正的可点控件，
+ *               不是"某行字"，所以连按钮的点击热区都是对的。
  */
 data class AiResult(
     val answer: String,
@@ -23,7 +26,8 @@ data class AiResult(
     val note: String,
     val px: Float = -1f,
     val py: Float = -1f,
-    val choice: Int = 0
+    val choice: Int = 0,
+    val nodeNo: Int = 0
 )
 
 /** 内置模型清单：都走 OpenAI 兼容接口。 */
@@ -77,7 +81,10 @@ private const val PROMPT_VISION =
     "如果答案就是屏幕上某一个可点选项，请在最后单独一行写 CHOICE:编号（只写数字）。" +
     "编号绝对不要写进答案正文。\n" +
     "8. 如果看不到编号但能确定位置，也可以写一行 POINT:x,y，x、y 是 0~1 的小数（左上角是 0,0）。" +
-    "能看到编号就只写 CHOICE，不要写 POINT。"
+    "能看到编号就只写 CHOICE，不要写 POINT。\n" +
+    "9. 如果题目下面还给了「可点控件清单」（每项像 E3 这样开头），答案又是其中某一项，" +
+    "请在最后单独一行写 CLICK:E编号（例如 CLICK:E3）。清单编号和图上的圆牌编号是两套，" +
+    "来自清单就写 CLICK:E…，来自图上圆牌就写 CHOICE:…，两者只写一个。"
 
 class AiClient(private val cfg: ConfigStore) {
 
@@ -92,6 +99,12 @@ class AiClient(private val cfg: ConfigStore) {
     )
 
     /**
+     * 「CLICK:E3」——模型从可点控件清单里挑的那一项。
+     * 必须带 CLICK 字样才算，否则正文里"点击第 3 个"之类会被误当成指令。
+     */
+    private val clickRe = Regex("CLICK\\s*[:：]\\s*E?\\s*(\\d{1,3})", RegexOption.IGNORE_CASE)
+
+    /**
      * 把坐标/编号行从答案正文里摘出来：正文给用户看，坐标与编号给自动点选用。
      * 编号是 0 基还是 1 基？截图上的圆牌是从 1 开始写的，所以这里原样返回，由调用方减 1。
      */
@@ -100,6 +113,7 @@ class AiClient(private val cfg: ConfigStore) {
         var px = -1f
         var py = -1f
         var choice = 0
+        var nodeNo = 0
 
         pointRe.find(text)?.let { m ->
             val x = m.groupValues[1].toFloatOrNull()
@@ -110,6 +124,13 @@ class AiClient(private val cfg: ConfigStore) {
                 text = text.replace(m.value, "")
             }
         }
+        clickRe.find(text)?.let { m ->
+            val n = m.groupValues[1].toIntOrNull() ?: 0
+            if (n > 0) {
+                nodeNo = n
+                text = text.replace(m.value, "")
+            }
+        }
         choiceRe.find(text)?.let { m ->
             val n = m.groupValues[1].toIntOrNull() ?: 0
             if (n > 0) {
@@ -117,7 +138,7 @@ class AiClient(private val cfg: ConfigStore) {
                 text = text.replace(m.value, "")
             }
         }
-        return AiResult(text.trim(), "", true, "", px, py, choice)
+        return AiResult(text.trim(), "", true, "", px, py, choice, nodeNo)
     }
 
     private val http = OkHttpClient.Builder()
@@ -220,7 +241,10 @@ class AiClient(private val cfg: ConfigStore) {
                 val text = data.getJSONArray("choices")
                     .getJSONObject(0).getJSONObject("message").getString("content")
                 val tagged = parseTags(text)
-                AiResult(tagged.answer, "$name · $model", true, "", tagged.px, tagged.py, tagged.choice)
+                AiResult(
+                    tagged.answer, "$name · $model", true, "",
+                    tagged.px, tagged.py, tagged.choice, tagged.nodeNo
+                )
             }
         } catch (e: Exception) {
             AiResult("", name, false, "调用失败：${e.javaClass.simpleName}")
