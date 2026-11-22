@@ -13,6 +13,8 @@ import java.util.concurrent.TimeUnit
 /**
  * @param px,py 看图时模型给出的"该点哪里"（相对坐标 0~1，左上为原点）。
  *              没有就是 -1 —— 调用方据此决定走节点点击还是坐标点击。
+ * @param choice 看图时模型选的编号（截图上的 Set-of-Mark 小圆牌）。
+ *               0 表示没有。有它时优先按"编号对应的文字框"点，比坐标准得多。
  */
 data class AiResult(
     val answer: String,
@@ -20,7 +22,8 @@ data class AiResult(
     val ok: Boolean,
     val note: String,
     val px: Float = -1f,
-    val py: Float = -1f
+    val py: Float = -1f,
+    val choice: Int = 0
 )
 
 /** 内置模型清单：都走 OpenAI 兼容接口。 */
@@ -62,16 +65,19 @@ private const val PROMPT_BRIEF =
 /**
  * 看图时追加的规则：
  *  5/6 让模型别因为"文字里没这个字"就说信息不足（猜字题的核心就在图里）；
- *  7   要一个可点击的坐标 —— 选项画在 Canvas/图片里时，节点树里没有它，
- *      只有坐标能把手指送到位。
+ *  7   Set-of-Mark：截图上的每行字都编了号，让模型"选编号"而不是估坐标。
+ *      这是 AppAgent / Mobile-Agent 的做法——模型认数字比认像素位置稳得多；
+ *  8   兼容坐标输出，作为编号缺失时的兜底。
  */
 private const val PROMPT_VISION =
     "\n5. 我同时发了一张手机屏幕截图。如果题目是「看图猜字 / 这个字读什么 / 图中是什么」，" +
     "请直接看图认字：指出那个字怎么写、读什么、拼音（带声调）是什么，不要因为文字里没有这个字就说信息不足。\n" +
     "6. 截图里可能混着 App 的广告、按钮、活动说明，以及一个写着「屏知」的小悬浮条，全部忽略，只关注题目本身。\n" +
-    "7. 如果截图里能看到答案对应的那个可点选项（哪怕它是画上去的图片），在最末尾单独一行给出它的中心位置，" +
-    "格式严格为：POINT:x,y。x、y 都是 0~1 之间的小数（屏幕左上角是 0,0，右下角是 1,1）。" +
-    "看不到明确选项就不要写这一行。"
+    "7. 截图里每一行文字左边都有一个带白色数字的小圆牌（编号）。这组编号只用来定位：" +
+    "如果答案就是屏幕上某一个可点选项，请在最后单独一行写 CHOICE:编号（只写数字）。" +
+    "编号绝对不要写进答案正文。\n" +
+    "8. 如果看不到编号但能确定位置，也可以写一行 POINT:x,y，x、y 是 0~1 的小数（左上角是 0,0）。" +
+    "能看到编号就只写 CHOICE，不要写 POINT。"
 
 class AiClient(private val cfg: ConfigStore) {
 
@@ -80,18 +86,45 @@ class AiClient(private val cfg: ConfigStore) {
         "(?:POINT|point|Point|坐标|位置)\\s*[:：]?\\s*[（(]?\\s*(-?\\d+(?:\\.\\d+)?)\\s*[，,\\s]\\s*(-?\\d+(?:\\.\\d+)?)"
     )
 
-    /** 把坐标行从答案正文里摘出来：正文给用户看，坐标给自动点选用。 */
-    private fun parsePoint(raw: String): Triple<String, Float, Float> {
-        val m = pointRe.find(raw) ?: return Triple(raw, -1f, -1f)
-        val px = m.groupValues[1].toFloatOrNull() ?: return Triple(raw, -1f, -1f)
-        val py = m.groupValues[2].toFloatOrNull() ?: return Triple(raw, -1f, -1f)
-        if (px < 0f || py < 0f) return Triple(raw, -1f, -1f)
-        return Triple(raw.replace(m.value, "").trim(), px, py)
+    /** 「CHOICE:3」这类编号行。带「选项编号/编号」写法也认。 */
+    private val choiceRe = Regex(
+        "(?:CHOICE|choice|Choice|选项编号|选择编号|编号)\\s*[:：]\\s*(\\d{1,3})"
+    )
+
+    /**
+     * 把坐标/编号行从答案正文里摘出来：正文给用户看，坐标与编号给自动点选用。
+     * 编号是 0 基还是 1 基？截图上的圆牌是从 1 开始写的，所以这里原样返回，由调用方减 1。
+     */
+    private fun parseTags(raw: String): AiResult {
+        var text = raw
+        var px = -1f
+        var py = -1f
+        var choice = 0
+
+        pointRe.find(text)?.let { m ->
+            val x = m.groupValues[1].toFloatOrNull()
+            val y = m.groupValues[2].toFloatOrNull()
+            if (x != null && y != null && x >= 0f && y >= 0f) {
+                px = x
+                py = y
+                text = text.replace(m.value, "")
+            }
+        }
+        choiceRe.find(text)?.let { m ->
+            val n = m.groupValues[1].toIntOrNull() ?: 0
+            if (n > 0) {
+                choice = n
+                text = text.replace(m.value, "")
+            }
+        }
+        return AiResult(text.trim(), "", true, "", px, py, choice)
     }
 
     private val http = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(22, TimeUnit.SECONDS)
+        // 总超时：视觉请求偶尔会"连上了但一直不吐字"，没有它整条链路会卡死在 busy 里
+        .callTimeout(24, TimeUnit.SECONDS)
         .build()
 
     /**
@@ -186,8 +219,8 @@ class AiClient(private val cfg: ConfigStore) {
                 val data = JSONObject(resp.body!!.string())
                 val text = data.getJSONArray("choices")
                     .getJSONObject(0).getJSONObject("message").getString("content")
-                val (clean, px, py) = parsePoint(text)
-                AiResult(clean, "$name · $model", true, "", px, py)
+                val tagged = parseTags(text)
+                AiResult(tagged.answer, "$name · $model", true, "", tagged.px, tagged.py, tagged.choice)
             }
         } catch (e: Exception) {
             AiResult("", name, false, "调用失败：${e.javaClass.simpleName}")

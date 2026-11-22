@@ -256,10 +256,15 @@ object AnswerOverlay {
         }
     }
 
-    /** 卡片当前占的屏幕区域。自动点选前用它判断"目标是不是被自己挡住了"。 */
+    /**
+     * 答案窗当前占的屏幕区域（展开是卡片，收起是右侧小胶囊）。
+     *
+     * 收起态也返回，是为了两件事：算识别/指纹时把这块钱排除掉
+     * （否则「◈ 答案」会被 OCR 当成题目文字），以及点选前判断
+     * "目标是不是被我自己挡住了"。
+     */
     fun cardBounds(): android.graphics.Rect? {
         val h = host ?: return null
-        if (card?.visibility != View.VISIBLE) return null
         val loc = IntArray(2)
         runCatching { h.getLocationOnScreen(loc) }
         if (h.width <= 0 || h.height <= 0) return null

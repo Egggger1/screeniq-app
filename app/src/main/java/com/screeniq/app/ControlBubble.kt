@@ -57,6 +57,19 @@ object ControlBubble {
 
     fun isShowing(): Boolean = host != null
 
+    /**
+     * 悬浮球当前占的屏幕区域（菜单展开时含菜单）。
+     * 用途有两个：算截图指纹时把这块钱排除掉（它自己会变），
+     * 以及自动点选前判断"要点的位置是不是被我自己的窗口挡住了"。
+     */
+    fun bounds(): android.graphics.Rect? {
+        val h = host ?: return null
+        if (h.width <= 0 || h.height <= 0) return null
+        val loc = IntArray(2)
+        runCatching { h.getLocationOnScreen(loc) }
+        return android.graphics.Rect(loc[0], loc[1], loc[0] + h.width, loc[1] + h.height)
+    }
+
     fun show(context: Context) {
         if (host != null) {
             updateRunning(ScreenReadService.instance?.isRunningNow() ?: running)
@@ -95,18 +108,19 @@ object ControlBubble {
         val root = FrameLayout(app)
 
         // 竖列：胶囊在上，菜单在它下方展开（关键：两者永不同位）
+        // 注意 minimumWidth 只给菜单，不给竖列——上一版把 212dp 给了整列，
+        // 结果收起态也是一条长条，正好压在题目选项上，既挡视线又挡点击。
         val col = LinearLayout(app).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
-            minimumWidth = (212 * d).toInt()
         }
 
-        // ---- 收起态：一粒窄胶囊（宽度跟随竖列，展开时会一起变宽） ----
+        // ---- 收起态：一粒小胶囊（只包住自己的字，尽量不压到下层内容） ----
         val pillView = TextView(app).apply {
             text = "◈ 屏知"
-            textSize = 12f
+            textSize = 11.5f
             gravity = Gravity.CENTER
-            setPadding((14 * d).toInt(), (9 * d).toInt(), (14 * d).toInt(), (9 * d).toInt())
+            setPadding((9 * d).toInt(), (6 * d).toInt(), (9 * d).toInt(), (6 * d).toInt())
             background = capsule(app, COLOR_OFF)
         }
         pill = pillView
@@ -114,6 +128,7 @@ object ControlBubble {
         // ---- 展开态：小菜单，第 1 行是标题+关闭，下面四项是操作 ----
         val menuView = LinearLayout(app).apply {
             orientation = LinearLayout.VERTICAL
+            minimumWidth = (208 * d).toInt()
             setPadding((6 * d).toInt(), (6 * d).toInt(), (6 * d).toInt(), (6 * d).toInt())
             background = rounded(app, Color.parseColor("#F6142321"), 16f, Color.parseColor("#8017C3B2"))
             visibility = View.GONE
@@ -228,7 +243,8 @@ object ControlBubble {
         running = on
         val c = if (on) COLOR_ON else COLOR_OFF
         pill?.let {
-            it.text = if (on) "◈ 屏知 · 运行中" else "◈ 屏知 · 已暂停"
+            // 只写状态、不写全名：收起的胶囊越窄，越不容易压住下面的题目/选项
+            it.text = if (on) "◈ 运行中" else "◈ 已暂停"
             it.setTextColor(Color.parseColor(c))
             it.background = capsule(it.context, c)
         }
