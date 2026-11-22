@@ -35,24 +35,22 @@ object Providers {
 }
 
 private const val PROMPT_DETAIL =
-    "你是一个手机端的贴身答疑助手，用户会把屏幕上看到的题目发给你。要求：\n" +
-    "1. 先给出最终答案，再讲简明解题步骤，重点突出。\n" +
-    "2. 用中文回答；公式写得清楚，能用 LaTeX 就用。\n" +
-    "3. 如果是选择题，明确指出正确选项并解释为什么。\n" +
-    "4. 如果题目信息不足，直接说明缺什么，不要瞎编。\n" +
-    "5. 回答精炼，不啰嗦。"
+    "你是手机端答疑助手，答案要让人一眼看完。规则：\n" +
+    "1. 第一行只写最终答案，格式「答案：xxx」。选择题写选项文字，例如「答案：B. 万里长征人未还」。\n" +
+    "2. 之后最多 3 行要点解析，每行不超过 30 字；不必解释就只给答案。\n" +
+    "3. 不要寒暄、不要复述题目、不要 Markdown 标题、不要加粗星号。\n" +
+    "4. 信息不足只写「信息不足」。"
 
 private const val PROMPT_BRIEF =
-    "你是一个手机端的贴身答疑助手，用户只想快速核对答案。要求：\n" +
-    "1. 只输出最终答案，不要解题步骤、不要解释、不要寒暄。\n" +
-    "2. 选择题只给选项字母和答案内容，例如「B. 3」。\n" +
-    "3. 能用一个数或一个词回答，就不要写完整句子。\n" +
-    "4. 用中文回答。信息不足时只说「信息不足」。"
+    "你是手机端答疑助手，用户只想快速核对答案。规则：\n" +
+    "1. 只输出一行：答案本身。选择题写成「A. 内容」。\n" +
+    "2. 不要解释、不要步骤、不要寒暄。\n" +
+    "3. 信息不足只写「信息不足」。"
 
 class AiClient(private val cfg: ConfigStore) {
     private val http = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(40, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
     suspend fun answer(question: String, explain: Boolean): AiResult = withContext(Dispatchers.IO) {
@@ -78,6 +76,8 @@ class AiClient(private val cfg: ConfigStore) {
                 })
                 put("temperature", 0.3)
                 put("stream", false)
+                // 限长=限时：不限的话模型会写一大段解析，光生成就要好几秒
+                put("max_tokens", if (explain) 360 else 90)
             }.toString()
 
             val req = Request.Builder()
