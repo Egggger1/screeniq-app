@@ -63,6 +63,7 @@ class ScreenReadService : AccessibilityService() {
         serviceInfo = serviceInfo.apply {
             flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
         }
+        cfg.setServiceConnected(true)
         cfg.appendLog("[服务] 无障碍读屏服务已连接")
         postNotification()
         broadcastState(true)
@@ -205,11 +206,13 @@ class ScreenReadService : AccessibilityService() {
 
     override fun onInterrupt() {
         running = false
+        cfg.setServiceConnected(false)
         broadcastState(false)
     }
 
     override fun onDestroy() {
         running = false
+        cfg.setServiceConnected(false)
         broadcastState(false)
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(1001)
         AnswerOverlay.hide()
