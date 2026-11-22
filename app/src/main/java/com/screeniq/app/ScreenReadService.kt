@@ -25,6 +25,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 
 /**
  * 后台自动识屏核心服务。
@@ -95,11 +96,40 @@ class ScreenReadService : AccessibilityService() {
         private const val MAX_QUESTION_CHARS = 1000
         private const val AUTO_CLICK_DELAY_MS = 1200L      // 出答案后稍等再自动点，让你看清答案
 
-        /** 题库/试卷措辞：出现即认为"这屏是题目"，不必等 AI 判。 */
+        /**
+         * 题库/试卷/活动答题措辞：出现即认为"这屏是题目"，不必等 AI 判。
+         * v0.2.7 补了"猜字/读音"这一类——拼多多"答题领奖励"那种游戏
+         * 用的是「看看这个字读什么」，既没 A./B. 标签也没有问号，
+         * 旧词表一个都不命中，导致整题被第一层就毙掉。
+         */
         private val STRONG_WORDS = listOf(
             "下列", "以下选项", "选择题", "单选题", "多选题", "判断题", "填空题",
             "正确的是", "错误的是", "不正确的是", "补全", "填空", "知识问答",
-            "选出", "请选择", "哪一项", "以下说法"
+            "选出", "请选择", "哪一项", "以下说法",
+            // 猜字 / 读音 / 看图类
+            "读什么", "念什么", "怎么读", "读音", "什么字", "哪个字", "这个字",
+            "看看这个", "图中", "下图", "上图", "看图猜", "猜一猜", "是什么成语",
+            "答题领", "答对得", "选对得",
+            // 补充（参考 FloatyAnswer 的宽词表，只取不容易撞车的）
+            "拼音", "含义", "意思是", "此字", "该字", "下面哪个", "哪项", "说法正确"
+        )
+
+        /**
+         * 视觉指代词：题干里的"字/图"不在文字节点里，而是一张图或 Canvas。
+         * 命中这些词时**强制走一次 OCR**，否则节点文字再多也读不到那个字。
+         */
+        private val VISUAL_WORDS = listOf(
+            "这个字", "什么字", "哪个字", "读什么", "念什么", "怎么读",
+            "图中", "下图", "上图", "看图", "图片", "图中所示"
+        )
+
+        /**
+         * 提问式表述：配合"并排选项按钮"这条结构证据使用。
+         * 只有按钮结构、没有任何提问语气（纯商品列表）时不放行，避免误判。
+         */
+        private val ASK_WORDS = listOf(
+            "什么", "哪个", "哪一", "怎么", "多少", "是否", "请问",
+            "选一个", "请选", "答案", "猜", "判断"
         )
 
         /** 购物/内容流特征词：只在"证据弱"时用来否决，避免把商品页当题目。 */
@@ -244,17 +274,46 @@ class ScreenReadService : AccessibilityService() {
             try {
                 var text = nodeText
                 var source = "节点"
+                var shotB64: String? = null
+
+                // 有"这个字 / 图中 / 读什么"这类指代 → 题干核心在图片里，
+                // 节点文字再多也没用，必须看图（视觉模型）或至少 OCR 一遍。
+                val needVisualEarly = VISUAL_WORDS.any { text.contains(it) }
 
                 // 节点里已经有"题干 + 选项"结构就不用 OCR（省 1~2 秒）
                 val nodeUseful = text.length >= 20 &&
                         (countOptionLabels(text) >= 1 || shortTexts >= 2)
-                if (!nodeUseful && allowOcr && ScreenshotOcr.supported &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
-                ) {
-                    val ocr = runCatching { ScreenshotOcr.readScreen(this@ScreenReadService) }.getOrNull()
-                    if (!ocr.isNullOrBlank() && ocr.length > text.length) {
-                        text = ocr
-                        source = "OCR"
+
+                val canShot = ScreenshotOcr.supported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+
+                // 只截一次图，OCR 与视觉模型共用同一张
+                val wantShot = allowOcr && canShot && (!nodeUseful || needVisualEarly)
+                if (wantShot) {
+                    val bmp = runCatching { ScreenshotOcr.grabScaled(this@ScreenReadService) }.getOrNull()
+                    if (bmp != null) {
+                        try {
+                            // ② 离线 OCR：快、免费，先把节点缺的字补进来
+                            val ocr = ScreenshotOcr.recognizeBitmap(bmp)
+                            if (!ocr.isNullOrBlank()) {
+                                val merged = mergeText(text, ocr)
+                                if (merged.length > text.length) {
+                                    text = merged
+                                    source = if (source == "节点") "节点+OCR" else source
+                                }
+                            }
+                            // ① 看图：OCR 之后才发现题面依赖图片（生僻字 OCR 也认不出），
+                            //    或节点一开始就点明要看图 → 才值得花一次视觉调用
+                            val needVisual = needVisualEarly || VISUAL_WORDS.any { text.contains(it) }
+                            if (needVisual && ai.canUseVision()) {
+                                val b64 = ScreenshotOcr.encodeBase64(bmp)
+                                if (!b64.isNullOrBlank()) {
+                                    shotB64 = b64
+                                    source = "OCR+看图"
+                                }
+                            }
+                        } finally {
+                            runCatching { bmp.recycle() }
+                        }
                     }
                 }
                 text = text.trim()
@@ -274,7 +333,7 @@ class ScreenReadService : AccessibilityService() {
                 if (fp == lastFingerprint) return@launch
 
                 // --- 情况 3：粗筛不像题目（这一层挡掉商品页/内容流，既少误弹又快）---
-                if (!looksLikeQuestion(text)) {
+                if (!looksLikeQuestion(text, root)) {
                     if (!manual && retryLater(allowOcr, attempt)) return@launch
                     if (manual) {
                         cfg.appendLog("[跳过] 读到 ${text.length} 字，判定不是题目：${text.take(60).replace('\n', ' ')}")
@@ -283,6 +342,7 @@ class ScreenReadService : AccessibilityService() {
                     return@launch
                 }
 
+                val question = buildQuestion(text, imageMode = shotB64 != null)
                 cfg.appendLog("[读题·$source] ${text.take(110).replace('\n', ' ')}")
                 postNotification("读到题目，正在问 AI…")
                 if (!manual) {
@@ -303,8 +363,20 @@ class ScreenReadService : AccessibilityService() {
                 }
                 broadcastState(true)
 
-                val result = runCatching { ai.answer(buildQuestion(text), cfg.explain()) }
-                    .getOrElse { AiResult("", "本地", false, "异常：${it.javaClass.simpleName}") }
+                var result = runCatching {
+                    val b64 = shotB64
+                    if (b64 != null) ai.answerWithImage(question, b64, cfg.explain())
+                    else ai.answer(question, cfg.explain())
+                }.getOrElse { AiResult("", "本地", false, "异常：${it.javaClass.simpleName}") }
+
+                // 降级链（借鉴 FloatyAnswer 的 VLM→OCR 兜底思路）：
+                // 看图这条路挂了（模型不支持/超时/网络），不能就此没答案，退回纯文字再问一次。
+                if (!result.ok && shotB64 != null) {
+                    cfg.appendLog("[降级] 看图失败（${result.note}），改用文字重试")
+                    result = runCatching { ai.answer(buildQuestion(text), cfg.explain()) }
+                        .getOrElse { AiResult("", "本地", false, "异常：${it.javaClass.simpleName}") }
+                }
+
                 val answer = result.answer.trim()
 
                 when {
@@ -317,6 +389,14 @@ class ScreenReadService : AccessibilityService() {
                     }
                     isNotAQuestion(answer) -> {
                         cfg.appendLog("[跳过] 模型判断不是题目")
+                        lastFingerprint = fp
+                        lastAskAt = System.currentTimeMillis() + FAIL_COOLDOWN_MS
+                        AnswerOverlay.hide()
+                    }
+                    needsImageOnly(answer) -> {
+                        // 模型说"这题得看图" —— 说明当前服务商没有视觉模型（如 DeepSeek）
+                        cfg.appendLog("[跳过] 这题要看图，当前模型不支持图片输入")
+                        postNotification("这题要看图：当前模型不支持，去面板换成 Kimi / 通义")
                         lastFingerprint = fp
                         lastAskAt = System.currentTimeMillis() + FAIL_COOLDOWN_MS
                         AnswerOverlay.hide()
@@ -423,13 +503,72 @@ class ScreenReadService : AccessibilityService() {
         return n
     }
 
+    /** 屏幕上一个短文本（候选选项）的文字 + 位置。 */
+    private class ShortLabel(val text: String, val rect: Rect)
+
+    private fun collectShortLabels(
+        node: AccessibilityNodeInfo?, depth: Int = 0, out: MutableList<ShortLabel> = mutableListOf()
+    ): List<ShortLabel> {
+        if (node == null || depth > 40) return out
+        val t = node.text?.toString()?.trim().orEmpty()
+        if (t.length in 1..10 && !node.isEditable) {
+            val r = Rect()
+            if (runCatching { node.getBoundsInScreen(r) }.isSuccess && r.width() > 0) {
+                out.add(ShortLabel(t, r))
+            }
+        }
+        for (i in 0 until node.childCount) {
+            val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
+            collectShortLabels(child, depth + 1, out)
+        }
+        return out
+    }
+
     /**
-     * 判定"这屏是不是一道题"。分三级，只有决定性证据才放行：
-     *  决定性：≥2 个选项标签 / 有填空横线 / 题库措辞
-     *  弱证据：单独的问号 —— 必须同时至少有一个选项标签
-     *  否决：证据弱且购物类特征词 ≥3 个
+     * 数"并排的短文本对"——这是比标点更可靠的结构证据。
+     *
+     * 拼多多的 xié / li 是两个大小相近、同一条水平线上、互不重叠的按钮；
+     * 商品列表里的文字是竖着排的、字号小，不会被算成选项对。
+     * 只有同时满足：中心高度接近、高度接近、水平相邻且间隙不大、自身够大（是按钮不是小标签）。
      */
-    private fun looksLikeQuestion(text: String): Boolean {
+    private fun countSideBySideOptions(root: AccessibilityNodeInfo?): Int {
+        val labels = collectShortLabels(root)
+        if (labels.size < 2) return 0
+        val dm = resources.displayMetrics
+        val tolY = (28 * dm.density).toInt()
+        val tolH = (20 * dm.density).toInt()
+        val minH = (26 * dm.density).toInt()      // 太薄的是小标签，不是选项按钮
+        val minW = (34 * dm.density).toInt()
+        val maxGap = (dm.widthPixels * 0.42f).toInt()
+        var pairs = 0
+        for (i in labels.indices) {
+            val a = labels[i]
+            if (a.rect.height() < minH || a.rect.width() < minW) continue
+            for (j in i + 1 until labels.size) {
+                val b = labels[j]
+                if (b.rect.height() < minH || b.rect.width() < minW) continue
+                if (abs(a.rect.centerY() - b.rect.centerY()) > tolY) continue
+                if (abs(a.rect.height() - b.rect.height()) > tolH) continue
+                val gap = when {
+                    a.rect.right <= b.rect.left -> b.rect.left - a.rect.right
+                    b.rect.right <= a.rect.left -> a.rect.left - b.rect.right
+                    else -> -1                                   // 重叠，不算并排
+                }
+                if (gap < 0 || gap > maxGap) continue
+                pairs++
+            }
+        }
+        return pairs
+    }
+
+    /**
+     * 判定"这屏是不是一道题"。只有决定性证据才放行：
+     *  决定性：≥2 个选项标签 / 有填空横线 / 题型措辞（含猜字读音）
+     *          / 并排选项按钮 + 有提问式表述
+     *  弱证据：单独的问号 —— 必须同时至少有一个选项标签
+     *  否决：只有弱证据且购物类特征词 ≥3 个
+     */
+    private fun looksLikeQuestion(text: String, root: AccessibilityNodeInfo?): Boolean {
         if (text.length < MIN_TEXT_LEN) return false
 
         val optionLabels = countOptionLabels(text)
@@ -437,11 +576,18 @@ class ScreenReadService : AccessibilityService() {
         val hasQMark = text.contains('？') || text.contains('?')
         val hasStrongWord = STRONG_WORDS.any { text.contains(it) }
 
-        val decisive = optionLabels >= 2 || hasBlank || hasStrongWord
+        // 结构证据：屏幕上真有两个并排的按钮式短文本
+        val sideBySide = if (hasStrongWord || optionLabels >= 2) 0
+                         else runCatching { countSideBySideOptions(root) }.getOrDefault(0)
+        val askPhrase = ASK_WORDS.any { text.contains(it) }
+        val structural = sideBySide >= 1 && (askPhrase || text.contains('？') || text.contains('?') ||
+                text.contains("什么") || text.contains("哪个"))
+
+        val decisive = optionLabels >= 2 || hasBlank || hasStrongWord || structural
         if (!decisive) {
             return hasQMark && optionLabels >= 1
         }
-        if (optionLabels < 2 && !hasBlank) {
+        if (optionLabels < 2 && !hasBlank && !hasStrongWord) {
             val noise = NOISE_WORDS.count { text.contains(it) }
             if (noise >= 3) return false
         }
@@ -454,7 +600,37 @@ class ScreenReadService : AccessibilityService() {
         return a.length <= 8 && (a.contains("不是题目") || a.contains("无法判断") || a.contains("信息不足"))
     }
 
-    private fun buildQuestion(screen: String): String {
+    /** 模型明确表示"这题要图才能答"——用于提示换视觉模型，而不是当成答不出。 */
+    private fun needsImageOnly(answer: String): Boolean {
+        val a = answer.trim()
+        if (a.length > 14) return false
+        return a.contains("需要看图") || a.contains("缺少图片") || a.contains("看不到图")
+    }
+
+    /**
+     * 把节点文字和 OCR 结果合并：节点行全保留，OCR 只补节点里没有的行。
+     * 很多页面节点能拿到题干却拿不到图里的字，合并比"二选一"更不容易丢信息。
+     */
+    private fun mergeText(node: String, ocr: String): String {
+        if (node.isBlank()) return ocr
+        if (ocr.isBlank()) return node
+        val have = node.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toHashSet()
+        val extra = ocr.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it.length <= 40 && it !in have }
+            .distinct()
+            .take(24)
+            .toList()
+        if (extra.isEmpty()) return node
+        val sb = StringBuilder(node)
+        for (line in extra) {
+            if (sb.length + line.length > MAX_QUESTION_CHARS) break
+            sb.append('\n').append(line)
+        }
+        return sb.toString()
+    }
+
+    private fun buildQuestion(screen: String, imageMode: Boolean = false): String {
         val cleaned = screen.lineSequence()
             .map { it.trim() }
             .filter { it.isNotEmpty() }
@@ -462,11 +638,16 @@ class ScreenReadService : AccessibilityService() {
             .joinToString("\n")
             .take(MAX_QUESTION_CHARS)
 
+        val extraRule =
+            if (imageMode) "4. 这道题的关键内容在截图里（比如一个认字题的字），请直接看图作答，不要回答「信息不足」。\n"
+            else "4. 如果是看图猜字、认字读音类题目而文字里没有那个字，就直接回复：需要看图\n"
+
         return "下面是我手机当前屏幕上的全部文字，可能夹着 App 的标题、按钮、规则、广告等无关内容。\n" +
                 "请你这样处理：\n" +
                 "1. 先判断其中有没有一道可以作答的题目。没有就只回复一个词：NONE\n" +
                 "2. 有题目就直接给答案。选项题请给出选项的文字（例如「杭州」），不要只给字母。\n" +
                 "3. 如果题目信息不足、无法确定答案，回复：信息不足\n" +
+                extraRule +
                 "屏幕文字如下：\n" +
                 "------\n$cleaned\n------"
     }

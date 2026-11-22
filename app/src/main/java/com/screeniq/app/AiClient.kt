@@ -6,6 +6,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -20,15 +21,15 @@ object Providers {
               "get_key_url" to "https://platform.deepseek.com/api_keys"),
         mapOf("id" to "kimi", "name" to "Kimi (Moonshot)", "model" to "moonshot-v1-8k",
               "base_url" to "https://api.moonshot.cn/v1/chat/completions",
-              "note" to "国产长文本模型",
+              "note" to "国产长文本模型，支持看图",
               "get_key_url" to "https://platform.moonshot.cn/console/api-keys"),
         mapOf("id" to "qwen", "name" to "通义千问 (DashScope)", "model" to "qwen-plus",
               "base_url" to "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-              "note" to "阿里云兼容模式",
+              "note" to "阿里云兼容模式，支持看图",
               "get_key_url" to "https://dashscope.console.aliyun.com/apiKey"),
         mapOf("id" to "openai", "name" to "OpenAI", "model" to "gpt-4o-mini",
               "base_url" to "https://api.openai.com/v1/chat/completions",
-              "note" to "需海外网络",
+              "note" to "需海外网络，支持看图",
               "get_key_url" to "https://platform.openai.com/api-keys"),
     )
     fun find(id: String) = list.find { it["id"] == id }
@@ -47,13 +48,49 @@ private const val PROMPT_BRIEF =
     "2. 不要解释、不要步骤、不要寒暄。\n" +
     "3. 信息不足只写「信息不足」。"
 
+/** 看图时追加的规则：这类题的答案就在图里，不能让模型说"信息不足"。 */
+private const val PROMPT_VISION =
+    "\n5. 我同时发了一张手机屏幕截图。如果题目是「看图猜字 / 这个字读什么 / 图中是什么」，" +
+    "请直接看图认字：指出那个字怎么写、读什么、拼音（带声调）是什么，不要因为文字里没有这个字就说信息不足。\n" +
+    "6. 截图里可能混着 App 的广告、按钮、活动说明，只关注题目本身。"
+
 class AiClient(private val cfg: ConfigStore) {
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    suspend fun answer(question: String, explain: Boolean): AiResult = withContext(Dispatchers.IO) {
+    /**
+     * 当前配置能不能"看图答题"。
+     * 猜字/认字/看图类题目，题干的核心（那个字）往往是一张图或 Canvas，
+     * 离线 OCR 对生僻字基本无能为力（"嫑"这种），只有视觉模型认得出来。
+     */
+    fun canUseVision(): Boolean = visionModel() != null
+
+    /** 视觉模型名；当前服务商没有视觉能力时返回 null（DeepSeek 就是这种情况）。 */
+    private fun visionModel(): String? {
+        val pid = cfg.provider()
+        val custom = cfg.model()
+        return when (pid) {
+            // Moonshot 的视觉模型走同一个 endpoint，只需换 model 名
+            "kimi" -> if (custom.contains("vision") || custom.contains("kimi-latest")) custom
+                      else "moonshot-v1-8k-vision-preview"
+            "qwen" -> if (custom.contains("vl")) custom else "qwen-vl-max"
+            "openai" -> custom.ifBlank { "gpt-4o-mini" }
+            else -> null
+        }
+    }
+
+    suspend fun answer(question: String, explain: Boolean): AiResult =
+        request(question, null, explain)
+
+    /** 带截图的提问：截图只在本机内存里压成 JPEG，随请求发出，不落盘。 */
+    suspend fun answerWithImage(question: String, imageBase64: String, explain: Boolean): AiResult =
+        request(question, imageBase64, explain)
+
+    private suspend fun request(
+        question: String, imageBase64: String?, explain: Boolean
+    ): AiResult = withContext(Dispatchers.IO) {
         val key = cfg.apiKey()
         val pid = cfg.provider()
         val provider = Providers.find(pid)
@@ -63,16 +100,35 @@ class AiClient(private val cfg: ConfigStore) {
         }
 
         val baseUrl = cfg.baseUrl().ifBlank { provider["base_url"] as String }
-        val model = cfg.model().ifBlank { provider["model"] as String }
+        val model = if (imageBase64 != null) {
+            visionModel() ?: (provider["model"] as String)
+        } else {
+            cfg.model().ifBlank { provider["model"] as String }
+        }
         val name = provider["name"] as String
-        val prompt = if (explain) PROMPT_DETAIL else PROMPT_BRIEF
+        val prompt = (if (explain) PROMPT_DETAIL else PROMPT_BRIEF) +
+                if (imageBase64 != null) PROMPT_VISION else ""
 
         try {
             val body = JSONObject().apply {
                 put("model", model)
-                put("messages", org.json.JSONArray().apply {
+                put("messages", JSONArray().apply {
                     put(JSONObject().put("role", "system").put("content", prompt))
-                    put(JSONObject().put("role", "user").put("content", question))
+                    if (imageBase64 == null) {
+                        put(JSONObject().put("role", "user").put("content", question))
+                    } else {
+                        // OpenAI 兼容的多模态格式：content 是数组
+                        val parts = JSONArray().apply {
+                            put(JSONObject().put("type", "text").put("text", question))
+                            put(
+                                JSONObject().put("type", "image_url").put(
+                                    "image_url",
+                                    JSONObject().put("url", "data:image/jpeg;base64,$imageBase64")
+                                )
+                            )
+                        }
+                        put(JSONObject().put("role", "user").put("content", parts))
+                    }
                 })
                 put("temperature", 0.3)
                 put("stream", false)
@@ -89,7 +145,9 @@ class AiClient(private val cfg: ConfigStore) {
 
             http.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
-                    return@withContext AiResult("", name, false, "接口返回 ${resp.code}")
+                    val hint = if (imageBase64 != null && (resp.code == 400 || resp.code == 404))
+                        "（$model 可能不支持图片，换个模型或关掉看图）" else ""
+                    return@withContext AiResult("", name, false, "接口返回 ${resp.code}$hint")
                 }
                 val data = JSONObject(resp.body!!.string())
                 val text = data.getJSONArray("choices")
