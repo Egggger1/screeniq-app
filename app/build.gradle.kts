@@ -11,8 +11,8 @@ android {
         applicationId = "com.screeniq.app"
         minSdk = 23          // 覆盖 Android 6.0+，荣耀绝大多数机型
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.2.2-权限状态修复"
+        versionCode = 4
+        versionName = "0.2.3-面板配置与光边框"
     }
 
     buildTypes {
