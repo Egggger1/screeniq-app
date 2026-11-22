@@ -38,6 +38,10 @@ class ConfigStore(context: Context) {
     fun explain(): Boolean = sp.getBoolean("explain", true)
     fun setExplain(v: Boolean) = sp.edit { putBoolean("explain", v) }
 
+    /** 无障碍服务是否真正连接上（由服务在 onServiceConnected/onDestroy 写入，供界面区分"开关开了"与"服务连上了"） */
+    fun serviceConnected(): Boolean = sp.getBoolean("service_connected", false)
+    fun setServiceConnected(v: Boolean) = sp.edit { putBoolean("service_connected", v) }
+
     /** 读屏日志（诊断用，最近若干条），只存文字摘要不存屏幕内容全文 */
     fun log(): String = sp.getString("read_log", "") ?: ""
     fun appendLog(line: String) {
