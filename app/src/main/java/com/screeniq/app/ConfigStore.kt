@@ -42,6 +42,10 @@ class ConfigStore(context: Context) {
     fun serviceConnected(): Boolean = sp.getBoolean("service_connected", false)
     fun setServiceConnected(v: Boolean) = sp.edit { putBoolean("service_connected", v) }
 
+    /** 全局运行光边框：开启后切到任意 App，屏幕四周都有流光表示在后台工作。默认开（视觉提示，不涉隐私） */
+    fun globalBorder(): Boolean = sp.getBoolean("global_border", true)
+    fun setGlobalBorder(v: Boolean) = sp.edit { putBoolean("global_border", v) }
+
     /** 读屏日志（诊断用，最近若干条），只存文字摘要不存屏幕内容全文 */
     fun log(): String = sp.getString("read_log", "") ?: ""
     fun appendLog(line: String) {
