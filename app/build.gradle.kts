@@ -11,13 +11,15 @@ android {
         applicationId = "com.screeniq.app"
         minSdk = 23          // 覆盖 Android 6.0+，荣耀绝大多数机型
         targetSdk = 35
-        versionCode = 9
+        versionCode = 10
         versionName = "0.3.0-自动作答可见与坐标点选"
 
-        // 只打真机在用的 arm64。ML Kit 的识别引擎每个 ABI 要 ~11MB，
-        // 四个 ABI 全带就是 45MB 白装——手机上只需要一个。
+        // 只打真机在用的两种 ABI。ML Kit 的识别引擎每个 ABI 要 ~11MB，
+        // 四个 ABI 全带就是 45MB 白装；x86/x86_64 是模拟器用的，手机根本用不到。
+        // 保留 armeabi-v7a 是为了老机型也能装——宁可多 7MB，也不能装不上。
         ndk {
             abiFilters.add("arm64-v8a")
+            abiFilters.add("armeabi-v7a")
         }
     }
 

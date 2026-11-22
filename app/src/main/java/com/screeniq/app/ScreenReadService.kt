@@ -304,6 +304,10 @@ class ScreenReadService : AccessibilityService() {
                 var source = "节点"
                 var shotB64: String? = null
 
+                // 每轮先清空上一屏的识别框：否则这一屏没截图时，
+                // 可能拿上一页的旧坐标去点，点错地方。
+                lastOcrLines = emptyList()
+
                 // 有"这个字 / 图中 / 读什么"这类指代 → 题干核心在图片里，
                 // 节点文字再多也没用，必须截图。
                 val needVisualEarly = VISUAL_WORDS.any { text.contains(it) }
