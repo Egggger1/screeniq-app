@@ -29,14 +29,6 @@
             </intent-filter>
         </activity>
 
-        <!-- 手动传图答题（原界面） -->
-        <activity
-            android:name=".MainActivity"
-            android:exported="false"
-            android:launchMode="singleTop"
-            android:windowSoftInputMode="adjustResize"
-            android:configChanges="orientation|screenSize|keyboardHidden" />
-
         <!-- 后台读屏服务：用户须在系统设置里手动开启 -->
         <service
             android:name=".ScreenReadService"

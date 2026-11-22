@@ -11,8 +11,14 @@ android {
         applicationId = "com.screeniq.app"
         minSdk = 23          // 覆盖 Android 6.0+，荣耀绝大多数机型
         targetSdk = 35
-        versionCode = 8
-        versionName = "0.2.7-悬浮菜单与看图答题"
+        versionCode = 9
+        versionName = "0.3.0-自动作答可见与坐标点选"
+
+        // 只打真机在用的 arm64。ML Kit 的识别引擎每个 ABI 要 ~11MB，
+        // 四个 ABI 全带就是 45MB 白装——手机上只需要一个。
+        ndk {
+            abiFilters.add("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -35,12 +41,9 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.webkit:webkit:1.11.0")           // WebView 能力增强
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
 
-    // 离线中文 OCR：standalone 版，模型打进 APK，不依赖谷歌服务（GMS）
-    // 荣耀/华为国行无 GMS 也能用
+    // 离线中文识别：standalone 版，模型打进 APK，不依赖 GMS。
+    // 它给的不只是文字，还有每一行的坐标框——自动点选能点中"画上去的选项"就靠这个。
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
 
     // 网络请求：直连大模型 API

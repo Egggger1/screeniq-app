@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 深色主题，跟网页界面风格一致；全面屏 -->
-    <style name="Theme.ScreenIQ" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+    <!-- 深色主题，跟悬浮窗风格一致。父主题用 AppCompat：
+         不再为了一个 Theme 去打包整个 Material 库（省 1~2MB，也少一堆资源冲突） -->
+    <style name="Theme.ScreenIQ" parent="Theme.AppCompat.DayNight.NoActionBar">
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">#091312</item>
         <item name="android:windowLightStatusBar">false</item>

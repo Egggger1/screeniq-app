@@ -10,7 +10,18 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
-data class AiResult(val answer: String, val model: String, val ok: Boolean, val note: String)
+/**
+ * @param px,py 看图时模型给出的"该点哪里"（相对坐标 0~1，左上为原点）。
+ *              没有就是 -1 —— 调用方据此决定走节点点击还是坐标点击。
+ */
+data class AiResult(
+    val answer: String,
+    val model: String,
+    val ok: Boolean,
+    val note: String,
+    val px: Float = -1f,
+    val py: Float = -1f
+)
 
 /** 内置模型清单：都走 OpenAI 兼容接口。 */
 object Providers {
@@ -48,13 +59,36 @@ private const val PROMPT_BRIEF =
     "2. 不要解释、不要步骤、不要寒暄。\n" +
     "3. 信息不足只写「信息不足」。"
 
-/** 看图时追加的规则：这类题的答案就在图里，不能让模型说"信息不足"。 */
+/**
+ * 看图时追加的规则：
+ *  5/6 让模型别因为"文字里没这个字"就说信息不足（猜字题的核心就在图里）；
+ *  7   要一个可点击的坐标 —— 选项画在 Canvas/图片里时，节点树里没有它，
+ *      只有坐标能把手指送到位。
+ */
 private const val PROMPT_VISION =
     "\n5. 我同时发了一张手机屏幕截图。如果题目是「看图猜字 / 这个字读什么 / 图中是什么」，" +
     "请直接看图认字：指出那个字怎么写、读什么、拼音（带声调）是什么，不要因为文字里没有这个字就说信息不足。\n" +
-    "6. 截图里可能混着 App 的广告、按钮、活动说明，只关注题目本身。"
+    "6. 截图里可能混着 App 的广告、按钮、活动说明，以及一个写着「屏知」的小悬浮条，全部忽略，只关注题目本身。\n" +
+    "7. 如果截图里能看到答案对应的那个可点选项（哪怕它是画上去的图片），在最末尾单独一行给出它的中心位置，" +
+    "格式严格为：POINT:x,y。x、y 都是 0~1 之间的小数（屏幕左上角是 0,0，右下角是 1,1）。" +
+    "看不到明确选项就不要写这一行。"
 
 class AiClient(private val cfg: ConfigStore) {
+
+    /** 「POINT:0.18,0.62」这类坐标行的解析式。模型偶尔写成中文冒号或全角逗号，一并兜住。 */
+    private val pointRe = Regex(
+        "(?:POINT|point|Point|坐标|位置)\\s*[:：]?\\s*[（(]?\\s*(-?\\d+(?:\\.\\d+)?)\\s*[，,\\s]\\s*(-?\\d+(?:\\.\\d+)?)"
+    )
+
+    /** 把坐标行从答案正文里摘出来：正文给用户看，坐标给自动点选用。 */
+    private fun parsePoint(raw: String): Triple<String, Float, Float> {
+        val m = pointRe.find(raw) ?: return Triple(raw, -1f, -1f)
+        val px = m.groupValues[1].toFloatOrNull() ?: return Triple(raw, -1f, -1f)
+        val py = m.groupValues[2].toFloatOrNull() ?: return Triple(raw, -1f, -1f)
+        if (px < 0f || py < 0f) return Triple(raw, -1f, -1f)
+        return Triple(raw.replace(m.value, "").trim(), px, py)
+    }
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -152,7 +186,8 @@ class AiClient(private val cfg: ConfigStore) {
                 val data = JSONObject(resp.body!!.string())
                 val text = data.getJSONArray("choices")
                     .getJSONObject(0).getJSONObject("message").getString("content")
-                AiResult(text, "$name · $model", true, "")
+                val (clean, px, py) = parsePoint(text)
+                AiResult(clean, "$name · $model", true, "", px, py)
             }
         } catch (e: Exception) {
             AiResult("", name, false, "调用失败：${e.javaClass.simpleName}")

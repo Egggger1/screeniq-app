@@ -12,14 +12,23 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
 /**
- * 截图 OCR 兜底：无障碍服务自带的 takeScreenshot（Android 11+）抓当前屏幕，
- * 再用离线 ML Kit 中文识别把字认出来。
+ * 一行被认出来的字 + 它在图上的位置（图中心坐标，像素）。
  *
- * 为什么需要它：
- * 很多 App 的界面是 H5 / 自绘控件，无障碍节点里拿不到文字（或只拿到按钮名），
- * 光靠节点会"读不到题"。截图 OCR 是最后的保底手段。
+ * 为什么要带位置：这版最关键的修复就是靠它。
+ * 拼多多/活动答题这类页面把选项画在 Canvas 或图片里，无障碍节点里
+ * 根本没有「长江」这个节点 —— 答案显示出来了，自动点选却永远找不到目标。
+ * 有了 OCR 的坐标框，就算它只是画上去的，也能按坐标戳中。
+ */
+data class OcrLine(val text: String, val cx: Float, val cy: Float)
+
+/**
+ * 截图 + 离线中文识别（Android 11+ 的无障碍截图接口）。
  *
- * 说明：全程在本机内存里处理，图片不落盘、不上传，识别完立刻回收。
+ * 一次抓图同时供两件事使用：
+ *  1. 认出文字（含每行坐标）→ 补节点读不到的字，并给出可点击的位置；
+ *  2. 压成 JPEG 交给视觉模型 → 生僻字（嫑、兲）只有它能认。
+ *
+ * 全文只在本机内存处理，图片不落盘。
  */
 object ScreenshotOcr {
 
@@ -30,57 +39,41 @@ object ScreenshotOcr {
     /** Android 11 以下没有无障碍截图接口，只能走节点。 */
     val supported: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
 
+    /** 抓一张已经缩好的屏幕图，调用方决定怎么用（识别 / 发给视觉模型）。 */
     @RequiresApi(Build.VERSION_CODES.R)
-    suspend fun readScreen(service: AccessibilityService): String? {
+    suspend fun grabScaled(service: AccessibilityService, maxWidth: Int = 1080): Bitmap? {
         val shot = grab(service) ?: return null
-        val scaled = downscale(shot)
-        val text = runCatching { recognize(scaled) }.getOrNull()
-        if (scaled !== shot) runCatching { scaled.recycle() }
-        runCatching { shot.recycle() }
-        return text
-    }
-
-    /**
-     * 抓一张"已经缩好的"屏幕图，交给调用方决定怎么用（OCR 还是发给视觉模型）。
-     *
-     * 为什么要暴露这一层：一次识屏常常既要 OCR 又要看图，
-     * 分开调 readScreen + captureBase64 会连截两次屏（多花 200~400ms 还可能截到不同画面）。
-     * 现在只截一次、共用一张图。
-     */
-    @RequiresApi(Build.VERSION_CODES.R)
-    suspend fun grabScaled(service: AccessibilityService): Bitmap? {
-        val shot = grab(service) ?: return null
-        val scaled = downscale(shot)
+        val scaled = downscale(shot, maxWidth)
         if (scaled !== shot) runCatching { shot.recycle() }
         return scaled
     }
 
-    /** 对已经拿到的图做离线中文识别。 */
-    suspend fun recognizeBitmap(bmp: Bitmap): String? =
-        runCatching { recognize(bmp) }.getOrNull()
+    /** 离线识别：返回每行文字及其中心点，供"按坐标点选"使用。 */
+    suspend fun recognizeLines(bmp: Bitmap): List<OcrLine> =
+        suspendCancellableCoroutine { cont ->
+            recognizer.process(InputImage.fromBitmap(bmp, 0))
+                .addOnSuccessListener { result ->
+                    val out = ArrayList<OcrLine>(24)
+                    for (block in result.textBlocks) {
+                        for (line in block.lines) {
+                            val t = line.text.trim()
+                            val box = line.boundingBox
+                            if (t.isEmpty() || box == null || box.width() <= 0) continue
+                            out.add(OcrLine(t, box.exactCenterX(), box.exactCenterY()))
+                        }
+                    }
+                    if (cont.isActive) cont.resume(out)
+                }
+                .addOnFailureListener { if (cont.isActive) cont.resume(emptyList()) }
+        }
 
     /** 把图压成 JPEG base64，随请求发给视觉模型；不落盘。 */
-    fun encodeBase64(bmp: Bitmap, quality: Int = 78): String? = runCatching {
+    fun encodeBase64(bmp: Bitmap, quality: Int = 72): String? = runCatching {
         java.io.ByteArrayOutputStream().use { out ->
             bmp.compress(Bitmap.CompressFormat.JPEG, quality, out)
             android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
         }
     }.getOrNull()
-
-    /**
-     * 抓当前屏幕并压成 JPEG base64，交给视觉模型认图。
-     *
-     * 为什么需要这条：猜字类题目（"看看这个字读什么"）的核心是一张图片，
-     * 生僻字（嫑、兲、烎…）离线 OCR 基本认不出，只有视觉模型能认。
-     * 图片只在内存里压缩后随请求发出，不写文件。
-     */
-    @RequiresApi(Build.VERSION_CODES.R)
-    suspend fun captureBase64(service: AccessibilityService, quality: Int = 78): String? {
-        val bmp = grabScaled(service) ?: return null
-        val b64 = encodeBase64(bmp, quality)
-        runCatching { bmp.recycle() }
-        return b64
-    }
 
     @RequiresApi(Build.VERSION_CODES.R)
     private suspend fun grab(service: AccessibilityService): Bitmap? =
@@ -110,18 +103,10 @@ object ScreenshotOcr {
         }
 
     /** 整屏太大识别慢，缩到 1080 宽足够认字。 */
-    private fun downscale(src: Bitmap): Bitmap {
-        val maxWidth = 1080
+    private fun downscale(src: Bitmap, maxWidth: Int): Bitmap {
         if (src.width <= maxWidth) return src
         val ratio = maxWidth.toFloat() / src.width
         val h = (src.height * ratio).toInt().coerceAtLeast(1)
         return runCatching { Bitmap.createScaledBitmap(src, maxWidth, h, true) }.getOrDefault(src)
     }
-
-    private suspend fun recognize(bmp: Bitmap): String? =
-        suspendCancellableCoroutine { cont ->
-            recognizer.process(InputImage.fromBitmap(bmp, 0))
-                .addOnSuccessListener { if (cont.isActive) cont.resume(it.text) }
-                .addOnFailureListener { if (cont.isActive) cont.resume(null) }
-        }
 }

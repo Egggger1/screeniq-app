@@ -50,7 +50,9 @@ object ControlBubble {
     private var pill: TextView? = null
     private var menu: LinearLayout? = null
     private var itemToggle: TextView? = null
+    private var itemAuto: TextView? = null
     private var running = false
+    private var autoOn = false
     private var expandedAt = 0L
 
     fun isShowing(): Boolean = host != null
@@ -58,6 +60,7 @@ object ControlBubble {
     fun show(context: Context) {
         if (host != null) {
             updateRunning(ScreenReadService.instance?.isRunningNow() ?: running)
+            updateAutoAction(ScreenReadService.instance?.isAutoActionNow() ?: autoOn)
             return
         }
         val app = context.applicationContext
@@ -95,7 +98,7 @@ object ControlBubble {
         val col = LinearLayout(app).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
-            minimumWidth = (188 * d).toInt()
+            minimumWidth = (212 * d).toInt()
         }
 
         // ---- 收起态：一粒窄胶囊（宽度跟随竖列，展开时会一起变宽） ----
@@ -108,7 +111,7 @@ object ControlBubble {
         }
         pill = pillView
 
-        // ---- 展开态：小菜单，第 1 行是标题+关闭，下面三行是操作 ----
+        // ---- 展开态：小菜单，第 1 行是标题+关闭，下面四项是操作 ----
         val menuView = LinearLayout(app).apply {
             orientation = LinearLayout.VERTICAL
             setPadding((6 * d).toInt(), (6 * d).toInt(), (6 * d).toInt(), (6 * d).toInt())
@@ -143,8 +146,38 @@ object ControlBubble {
         menuView.addView(titleRow, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-        // 三个操作项
-        val toggleItem = menuItem(app, "暂停自动识屏", primary = true, d) {
+        // 四个操作项，按"最常用在上"排：
+        //  ① 识屏作答（一步到位：读屏 → AI → 显示 → 点选）
+        //  ② 自动作答开关（状态直接写在字上，不用猜）
+        //  ③ 暂停 / 开始自动识屏
+        //  ④ 打开面板
+        menuView.addView(menuItem(app, "⚡ 识屏作答", primary = true, d) {
+            if (guard()) return@menuItem
+            val svc = ScreenReadService.instance
+            if (svc == null) {
+                toast(app, "读屏服务没连上：先回面板开一次读屏权限")
+            } else {
+                svc.readNowManual()
+                toast(app, if (svc.isAutoActionNow()) "读屏中…答案会自动点上去" else "读屏中…答案会浮在屏幕上（自动作答未开）")
+            }
+            collapse()
+        }, itemLp(d))
+
+        val autoItem = menuItem(app, "自动作答", primary = false, d) {
+            if (guard()) return@menuItem
+            val svc = ScreenReadService.instance
+            if (svc == null) {
+                toast(app, "读屏服务没连上")
+            } else {
+                updateAutoAction(svc.toggleAutoAction())
+                toast(app, if (autoOn) "自动作答已开：答案一出来就自己点" else "自动作答已关：只显示答案")
+            }
+            // 故意不收起：让你当场看到状态变了
+        }
+        itemAuto = autoItem
+        menuView.addView(autoItem, itemLp(d))
+
+        val toggleItem = menuItem(app, "暂停自动识屏", primary = false, d) {
             if (guard()) return@menuItem
             val svc = ScreenReadService.instance
             if (svc == null) {
@@ -158,18 +191,6 @@ object ControlBubble {
         }
         itemToggle = toggleItem
         menuView.addView(toggleItem, itemLp(d))
-
-        menuView.addView(menuItem(app, "⚡ 识屏一次", primary = false, d) {
-            if (guard()) return@menuItem
-            val svc = ScreenReadService.instance
-            if (svc == null) {
-                toast(app, "读屏服务没连上")
-            } else {
-                svc.readNowManual()
-                toast(app, "屏知：读一次当前屏幕")
-            }
-            collapse()
-        }, itemLp(d))
 
         menuView.addView(menuItem(app, "⚙ 打开面板", primary = false, d) {
             if (guard()) return@menuItem
@@ -196,9 +217,10 @@ object ControlBubble {
         makeDraggable(app, pillView)
 
         if (!runCatching { w.addView(root, p) }.isSuccess) {
-            host = null; pill = null; menu = null; itemToggle = null; wm = null; return
+            host = null; pill = null; menu = null; itemToggle = null; itemAuto = null; wm = null; return
         }
         updateRunning(ScreenReadService.instance?.isRunningNow() ?: running)
+        updateAutoAction(ScreenReadService.instance?.isAutoActionNow() ?: autoOn)
     }
 
     /** 刷新"运行中/已暂停"的外观。服务状态一变就调它。 */
@@ -223,6 +245,23 @@ object ControlBubble {
         }
     }
 
+    /**
+     * 刷新「自动作答」这一项：开启=绿色描边，关闭=琥珀色提示"点此开启"。
+     * 用户上一轮的原话是"菜单里没有自动回答的按钮"——这一项就是为它加的。
+     */
+    fun updateAutoAction(on: Boolean) {
+        autoOn = on
+        val it = itemAuto ?: return
+        val d = it.context.resources.displayMetrics.density
+        it.text = if (on) "◎ 自动作答 · 已开启" else "◎ 自动作答 · 点此开启"
+        it.setTextColor(Color.parseColor(if (on) "#A3E8D8" else "#FFD98F"))
+        it.background = if (on)
+            rounded(it.context, Color.parseColor("#1E332F"), 12f, Color.parseColor("#6017C3B2"))
+        else
+            rounded(it.context, Color.parseColor("#3A2F1E"), 12f, Color.parseColor("#80FFD98F"))
+        it.setPadding((14 * d).toInt(), (11 * d).toInt(), (14 * d).toInt(), (11 * d).toInt())
+    }
+
     fun hide() {
         val h = host ?: return
         runCatching { wm?.removeView(h) }
@@ -230,6 +269,7 @@ object ControlBubble {
         pill = null
         menu = null
         itemToggle = null
+        itemAuto = null
         expandedAt = 0L
     }
 

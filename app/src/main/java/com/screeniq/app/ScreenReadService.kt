@@ -37,9 +37,12 @@ import kotlin.math.abs
  *
  * 判题：本地强结构判据（选项标签 / 填空 / 题库措辞）+ 购物类噪声否决；
  *       过筛后直接送 AI，不再每张页面都问一遍，所以又快又少误弹。
+ *       有截图在场时不做这套粗筛——画在 Canvas 上的题本来就没什么文字，
+ *       让模型自己回 NONE 反而更准。
  *
- * 自动操控：开关打开后，答案一到就**自动点选**对应选项（高置信匹配才动手），
- *           不需要用户再点浮窗按钮；匹配不上会说明原因，绝不瞎点。
+ * 自动操控（opt-in）：答案一到就自动点选，分三条路线从准到糙：
+ *   ① 无障碍节点（原生控件）→ ② 截图识别出的文字框（H5/Canvas 画上去的选项）
+ *   → ③ 模型给的相对坐标。三条都不行就写明原因，绝不瞎点。
  */
 class ScreenReadService : AccessibilityService() {
 
@@ -58,6 +61,16 @@ class ScreenReadService : AccessibilityService() {
     private var lastClickedFp = ""
     private var busy = false
     private var heartbeat: Runnable? = null
+
+    /** 最近一次截图识别到的文字行（带图内坐标）。自动点选靠它点"画上去的选项"。 */
+    private var lastOcrLines: List<OcrLine> = emptyList()
+    private var lastShotW = 0
+    private var lastShotH = 0
+    private var lastImageAskAt = 0L
+
+    /** 模型最近一次给出的点击位置（相对坐标）；供浮窗上手动"点选"复用。 */
+    private var lastPx = -1f
+    private var lastPy = -1f
 
     private val cmdReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
@@ -88,13 +101,14 @@ class ScreenReadService : AccessibilityService() {
 
         private const val MIN_ASK_INTERVAL_MS = 600L      // 两次答题最短间隔
         private const val MIN_ATTEMPT_INTERVAL_MS = 300L   // 事件风暴节流
+        private const val IMAGE_INTERVAL_MS = 2200L        // 两次"截图问模型"之间至少隔这么久（截图+视觉都贵）
         private const val FAIL_COOLDOWN_MS = 5000L         // 失败后同一屏冷却
         private const val SETTLE_DELAY_MS = 220L           // 事件后等渲染稳定
         private const val HEARTBEAT_MS = 1500L             // 巡检周期
         private const val MAX_ATTEMPTS = 3
         private const val MIN_TEXT_LEN = 10
         private const val MAX_QUESTION_CHARS = 1000
-        private const val AUTO_CLICK_DELAY_MS = 1200L      // 出答案后稍等再自动点，让你看清答案
+        private const val AUTO_CLICK_DELAY_MS = 900L       // 出答案后稍等再自动点，让你看清答案
 
         /**
          * 题库/试卷/活动答题措辞：出现即认为"这屏是题目"，不必等 AI 判。
@@ -192,12 +206,26 @@ class ScreenReadService : AccessibilityService() {
         return v
     }
 
-    /** 悬浮球上的「识屏」：立刻读一次当前屏幕。 */
+    /** 悬浮球上的「识屏作答」：立刻读一次当前屏幕，走完整条链路（含自动点选）。 */
     fun readNowManual() {
         lastFingerprint = ""
         lastAskAt = 0
         lastAttemptAt = 0
+        lastClickedFp = ""
+        lastOcrLines = emptyList()
         readOnce(allowOcr = true, manual = true)
+    }
+
+    fun isAutoActionNow(): Boolean = runCatching { cfg.autoAction() }.getOrDefault(false)
+
+    /** 悬浮球上的「自动作答」开关：答案一到就自己点，不用再点浮窗按钮。 */
+    fun toggleAutoAction(): Boolean {
+        val v = !cfg.autoAction()
+        cfg.setAutoAction(v)
+        cfg.appendLog(if (v) "[开关] 自动作答：开（答案一到就点）" else "[开关] 自动作答：关（只显示答案）")
+        ControlBubble.updateAutoAction(v)
+        broadcastState(cfg.autoRead())
+        return v
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -277,40 +305,44 @@ class ScreenReadService : AccessibilityService() {
                 var shotB64: String? = null
 
                 // 有"这个字 / 图中 / 读什么"这类指代 → 题干核心在图片里，
-                // 节点文字再多也没用，必须看图（视觉模型）或至少 OCR 一遍。
+                // 节点文字再多也没用，必须截图。
                 val needVisualEarly = VISUAL_WORDS.any { text.contains(it) }
 
-                // 节点里已经有"题干 + 选项"结构就不用 OCR（省 1~2 秒）
+                // 节点里已经有"题干 + 选项"结构就不用截图（省 1 秒，也省一次视觉调用）
                 val nodeUseful = text.length >= 20 &&
                         (countOptionLabels(text) >= 1 || shortTexts >= 2)
 
-                val canShot = ScreenshotOcr.supported && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                // 视觉调用有成本也有延迟：自动路径上别连续狂问
+                val throttled = !manual && now - lastImageAskAt < IMAGE_INTERVAL_MS
 
-                // 只截一次图，OCR 与视觉模型共用同一张
-                val wantShot = allowOcr && canShot && (!nodeUseful || needVisualEarly)
+                // 只截一次图：识别与视觉模型共用同一张
+                val wantShot = allowOcr && ScreenshotOcr.supported && (!nodeUseful || needVisualEarly) && !throttled
                 if (wantShot) {
                     val bmp = runCatching { ScreenshotOcr.grabScaled(this@ScreenReadService) }.getOrNull()
                     if (bmp != null) {
+                        lastShotW = bmp.width
+                        lastShotH = bmp.height
                         try {
-                            // ② 离线 OCR：快、免费，先把节点缺的字补进来
-                            val ocr = ScreenshotOcr.recognizeBitmap(bmp)
-                            if (!ocr.isNullOrBlank()) {
-                                val merged = mergeText(text, ocr)
+                            // 离线识别：既补节点读不到的字，也给出每行的位置（自动点选要用）
+                            val lines = runCatching { ScreenshotOcr.recognizeLines(bmp) }.getOrDefault(emptyList())
+                            lastOcrLines = lines
+                            if (lines.isNotEmpty()) {
+                                val merged = mergeText(text, lines.joinToString("\n") { it.text })
                                 if (merged.length > text.length) {
                                     text = merged
-                                    source = if (source == "节点") "节点+OCR" else source
+                                    source = if (source == "节点") "节点+识别" else source
                                 }
                             }
-                            // ① 看图：OCR 之后才发现题面依赖图片（生僻字 OCR 也认不出），
-                            //    或节点一开始就点明要看图 → 才值得花一次视觉调用
+                            // 图里的字离线认不出（生僻字），或题面本来就指着图 → 才多花一次视觉调用
                             val needVisual = needVisualEarly || VISUAL_WORDS.any { text.contains(it) }
-                            if (needVisual && ai.canUseVision()) {
+                            if (ai.canUseVision() && (needVisual || lines.isEmpty())) {
                                 val b64 = ScreenshotOcr.encodeBase64(bmp)
                                 if (!b64.isNullOrBlank()) {
                                     shotB64 = b64
-                                    source = "OCR+看图"
+                                    source = "识别+看图"
                                 }
                             }
+                            lastImageAskAt = now
                         } finally {
                             runCatching { bmp.recycle() }
                         }
@@ -318,8 +350,8 @@ class ScreenReadService : AccessibilityService() {
                 }
                 text = text.trim()
 
-                // --- 情况 1：文字太少，可能页面还没渲染完 ---
-                if (text.length < MIN_TEXT_LEN) {
+                // --- 情况 1：文字太少。有截图就交给模型看图判定，没有才等渲染 ---
+                if (text.length < MIN_TEXT_LEN && shotB64 == null) {
                     if (!manual && retryLater(allowOcr, attempt)) return@launch
                     if (manual) {
                         cfg.appendLog("[识屏] 没读到文字（节点 ${nodeText.length} 字）")
@@ -329,11 +361,11 @@ class ScreenReadService : AccessibilityService() {
                 }
 
                 // --- 情况 2：内容没变，跳过 ---
-                val fp = fingerprint(text)
+                val fp = fingerprint(text) + if (shotB64 != null) "|img" else ""
                 if (fp == lastFingerprint) return@launch
 
-                // --- 情况 3：粗筛不像题目（这一层挡掉商品页/内容流，既少误弹又快）---
-                if (!looksLikeQuestion(text, root)) {
+                // --- 情况 3：粗筛不像题目。有截图时交给模型自己判 NONE，别让启发式挡掉画出来的题 ---
+                if (shotB64 == null && !looksLikeQuestion(text, root)) {
                     if (!manual && retryLater(allowOcr, attempt)) return@launch
                     if (manual) {
                         cfg.appendLog("[跳过] 读到 ${text.length} 字，判定不是题目：${text.take(60).replace('\n', ' ')}")
@@ -405,6 +437,8 @@ class ScreenReadService : AccessibilityService() {
                         cfg.appendLog("[答案] ${stripMd(answer).take(120).replace('\n', ' ')}")
                         lastFingerprint = fp
                         lastAskAt = System.currentTimeMillis()
+                        lastPx = result.px
+                        lastPy = result.py
                         withContext(Dispatchers.Main) {
                             showAnswer(answer)
                             // 自动操控：不用再点按钮，答案出来就自己点
@@ -437,14 +471,17 @@ class ScreenReadService : AccessibilityService() {
     }
 
     /**
-     * 自动操控的主体：开关打开 → 延迟 1.2 秒（让你先看到答案）→ 自动点。
-     * 只做"高置信"匹配（选项文字与答案规范化后完全相等），近乎不会点错；
-     * 匹不上就写明原因，留在浮窗上让你手动点。
+     * 自动操控的主体：开关打开 → 延迟 0.9 秒（让你先看到答案）→ 自动点。
+     * 点选分三条路线，从准到糙依次兜底：
+     *   ① 无障碍节点（原生控件）
+     *   ② 截图识别出的文字框（H5 / Canvas 画上去的选项，节点里没有）
+     *   ③ 视觉模型给的坐标（整题都是图片、连字都认不出时）
+     * 三条都失败就写明原因留在浮窗上，绝不瞎点。
      */
     private fun scheduleAutoClick(answer: String, fp: String) {
         if (!cfg.autoAction()) return
         if (fp == lastClickedFp) return
-        cfg.appendLog("[操控] 自动操控开启，准备点选…")
+        cfg.appendLog("[操控] 自动作答已开，准备点选…")
         main.postDelayed({
             val msg = autoClickAnswer(answer, exactOnly = true)
             if (msg.startsWith("已点选")) {
@@ -639,8 +676,11 @@ class ScreenReadService : AccessibilityService() {
             .take(MAX_QUESTION_CHARS)
 
         val extraRule =
-            if (imageMode) "4. 这道题的关键内容在截图里（比如一个认字题的字），请直接看图作答，不要回答「信息不足」。\n"
+            if (imageMode) "4. 这道题的关键内容在截图里（题干或选项可能是画上去的），请直接看图作答，不要回答「信息不足」。\n"
             else "4. 如果是看图猜字、认字读音类题目而文字里没有那个字，就直接回复：需要看图\n"
+
+        val body = if (cleaned.isBlank() && imageMode)
+            "（这一屏几乎没有文字，题目和选项都画在图上，请看截图）" else cleaned
 
         return "下面是我手机当前屏幕上的全部文字，可能夹着 App 的标题、按钮、规则、广告等无关内容。\n" +
                 "请你这样处理：\n" +
@@ -649,7 +689,7 @@ class ScreenReadService : AccessibilityService() {
                 "3. 如果题目信息不足、无法确定答案，回复：信息不足\n" +
                 extraRule +
                 "屏幕文字如下：\n" +
-                "------\n$cleaned\n------"
+                "------\n$body\n------"
     }
 
     // ======================= 自动操控 =======================
@@ -659,39 +699,97 @@ class ScreenReadService : AccessibilityService() {
      * @param exactOnly true=只接受"规范化后完全相等"的高置信匹配（自动点选用）
      */
     private fun autoClickAnswer(rawAnswer: String, exactOnly: Boolean): String {
-        // 用实时节点树：读题时的旧树常常已失效，performAction 会返回 false
-        val root = runCatching { rootInActiveWindow }.getOrNull() ?: pendingRoot
-        if (root == null) {
-            cfg.appendLog("[操控] 拿不到当前界面节点")
-            return "拿不到当前界面"
-        }
-
         val cands = candidates(rawAnswer)
+        if (cands.isEmpty()) return "答案里没有可点的词"
         cfg.appendLog("[操控] 候选：${cands.take(5).joinToString(" / ")}")
 
-        for (c in cands) {
-            val node = findOptionNode(root, c, exactOnly) ?: continue
-            if (clickNode(node)) {
-                cfg.appendLog("[操控] 已点选：$c")
-                return "已点选：$c"
+        // ---- 路线 1：无障碍节点（原生控件最准）----
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: pendingRoot
+        if (root != null) {
+            for (c in cands) {
+                val node = findOptionNode(root, c, exactOnly) ?: continue
+                if (clickNode(node)) {
+                    cfg.appendLog("[操控] 已点选（节点）：$c")
+                    return "已点选：$c"
+                }
+                cfg.appendLog("[操控] 命中「$c」但点击失败")
             }
-            cfg.appendLog("[操控] 命中「$c」但点击失败")
-        }
-
-        // 字母兜底（"选 A" 这类）
-        if (!exactOnly) {
-            val letter = optionLetter(rawAnswer)
-            if (letter != null) {
-                val node = findLetterOption(root, letter)
-                if (node != null && clickNode(node)) {
-                    cfg.appendLog("[操控] 已点选选项 $letter")
-                    return "已点选：选项 $letter"
+            if (!exactOnly) {
+                val letter = optionLetter(rawAnswer)
+                if (letter != null) {
+                    val node = findLetterOption(root, letter)
+                    if (node != null && clickNode(node)) {
+                        cfg.appendLog("[操控] 已点选选项 $letter")
+                        return "已点选：选项 $letter"
+                    }
                 }
             }
         }
 
+        // ---- 路线 2：截图识别出的文字框（选项是画上去的，节点树里根本没有）----
+        val hit = findByOcr(cands, exactOnly)
+        if (hit != null && tapImagePoint(hit.second, hit.third)) {
+            cfg.appendLog("[操控] 已点选（识别框）：${hit.first}")
+            return "已点选：${hit.first}"
+        }
+
+        // ---- 路线 3：模型给的坐标（整题都是图、字也认不出时）----
+        if (tapRelative(lastPx, lastPy)) {
+            cfg.appendLog("[操控] 已点选（模型坐标）：$lastPx,$lastPy")
+            return "已点选：${cands.first()}"
+        }
+
         cfg.appendLog("[操控] 没找到对应选项（不瞎点）")
         return "没找到对应选项"
+    }
+
+    /** 在最近一次识别结果里找答案对应的那一行，返回（原文, 图内中心 x, y）。 */
+    private fun findByOcr(cands: List<String>, exactOnly: Boolean): Triple<String, Float, Float>? {
+        if (lastOcrLines.isEmpty()) return null
+        var best: Triple<String, Float, Float>? = null
+        var bestScore = Int.MAX_VALUE
+        for (c in cands) {
+            val t = normalize(c)
+            if (t.length < 2) continue
+            for (line in lastOcrLines) {
+                val u = normalize(line.text)
+                if (u.isEmpty()) continue
+                val score = when {
+                    u == t -> 0
+                    exactOnly -> -1
+                    u.contains(t) -> 1 + (u.length - t.length)
+                    t.contains(u) && u.length >= 2 -> 5 + (t.length - u.length)
+                    else -> -1
+                }
+                if (score in 0 until bestScore) {
+                    bestScore = score
+                    best = Triple(line.text, line.cx, line.cy)
+                }
+            }
+        }
+        return best
+    }
+
+    /** 把"截图里的像素点"换算成屏幕坐标再点。截图是缩放过的，必须按比例还原。 */
+    private fun tapImagePoint(cxImg: Float, cyImg: Float): Boolean {
+        if (lastShotW <= 0 || lastShotH <= 0) return false
+        val dm = resources.displayMetrics
+        return tapAt(cxImg * dm.widthPixels / lastShotW, cyImg * dm.heightPixels / lastShotH)
+    }
+
+    /** 按模型给的相对坐标（0~1）点；模型偶尔直接给像素，>1 时按截图尺寸归一化。 */
+    private fun tapRelative(nxIn: Float, nyIn: Float): Boolean {
+        if (nxIn < 0f || nyIn < 0f) return false
+        var nx = nxIn
+        var ny = nyIn
+        if (nx > 1f || ny > 1f) {
+            if (lastShotW <= 0 || lastShotH <= 0) return false
+            nx /= lastShotW
+            ny /= lastShotH
+        }
+        if (nx !in 0f..1f || ny !in 0f..1f) return false
+        val dm = resources.displayMetrics
+        return tapAt(nx * dm.widthPixels, ny * dm.heightPixels)
     }
 
     /** 把答案拆成候选词：去 Markdown、去「答案：」前缀、按标点切。 */
@@ -826,18 +924,26 @@ class ScreenReadService : AccessibilityService() {
         val r = Rect()
         runCatching { n.getBoundsInScreen(r) }
         if (r.width() <= 0 || r.height() <= 0) return false
-        val cx = r.exactCenterX()
-        val cy = r.exactCenterY()
+        return tapAt(r.exactCenterX(), r.exactCenterY())
+    }
 
-        // 目标正好在我们的答案卡下面：手势会戳到卡片自己，先收卡再点
+    /** 统一的"手指送到 (x,y)"：先在安全区内，被答案卡挡住就先收卡再点。 */
+    private fun tapAt(x: Float, y: Float): Boolean {
+        val dm = resources.displayMetrics
+        if (x < 2f || y < 2f || x > dm.widthPixels - 2f) return false
+        // 底部手势条区域不碰，否则会变成"返回桌面"
+        if (y > dm.heightPixels * 0.96f) {
+            cfg.appendLog("[操控] 目标在底部手势区，跳过")
+            return false
+        }
         val card = AnswerOverlay.cardBounds()
-        if (card != null && card.contains(cx.toInt(), cy.toInt())) {
+        if (card != null && card.contains(x.toInt(), y.toInt())) {
             cfg.appendLog("[操控] 目标被答案卡遮住，先收卡再点")
             AnswerOverlay.collapseNow()
-            main.postDelayed({ doGesture(cx, cy) }, 220L)
+            main.postDelayed({ doGesture(x, y) }, 220L)
             return true
         }
-        return doGesture(cx, cy)
+        return doGesture(x, y)
     }
 
     private fun doGesture(x: Float, y: Float): Boolean {
@@ -867,6 +973,7 @@ class ScreenReadService : AccessibilityService() {
         if (on && cfg.globalBorder()) RunningBorderOverlay.show(this) else RunningBorderOverlay.hide()
         if (cfg.bubble() && !AppVisible.foreground) ControlBubble.show(this) else ControlBubble.hide()
         ControlBubble.updateRunning(on)
+        ControlBubble.updateAutoAction(cfg.autoAction())
         broadcastState(on)
         postNotification(if (on) "屏知正在后台识屏，切到题目页会自动作答" else "屏知已暂停，点悬浮球可继续")
     }

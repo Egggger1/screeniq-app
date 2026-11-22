@@ -180,7 +180,7 @@ class ControlActivity : AppCompatActivity() {
         // ---- 四个开关 ----
         swRead = makeSwitch(root, "自动识屏（后台读题并作答）")
         swOverlay = makeSwitch(root, "悬浮窗就地显示答案")
-        swAction = makeSwitch(root, "自动操控（答案一到就自动点选 · 默认关）")
+        swAction = makeSwitch(root, "自动作答（答案一到就自己点选项）")
         swExplain = makeSwitch(root, "详细解释（答案 + 解题步骤）")
 
         swRead.setOnCheckedChangeListener { _, v ->
@@ -205,7 +205,8 @@ class ControlActivity : AppCompatActivity() {
         swAction.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
             cfg.setAutoAction(v)
-            if (v) Toast.makeText(this, "自动操控已开启：答案一出来就会自动点选对应选项。只在自己练习时使用。", Toast.LENGTH_LONG).show()
+            ControlBubble.updateAutoAction(v)   // 悬浮球菜单里的那一项跟着变
+            if (v) Toast.makeText(this, "自动作答已开启：答案一出来就自己点选。只在自己练习时使用。", Toast.LENGTH_LONG).show()
             refreshGuide()
         }
         swExplain.setOnCheckedChangeListener { _, v ->
@@ -243,9 +244,9 @@ class ControlActivity : AppCompatActivity() {
             android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 16 })
 
         val tryTip = TextView(this).apply {
-            text = "平时不用点它：切到题目页会自动读（页面变化会触发，静止时每 3 秒也会巡检一次）。" +
+            text = "平时不用点它：切到题目页会自动读（页面变化会触发，静止时每 1.5 秒也会巡检一次）。" +
                    "这个按钮只用来排障——点了之后 4 秒内切到题目页，它会把每一步写进下面的日志：" +
-                   "「读题」= 读到了；「跳过」= 判定不是题目；「失败」= 密钥或网络问题。"
+                   "「读题」= 读到了；「跳过」= 判定不是题目；「操控」= 点选过程；「失败」= 密钥或网络问题。"
             setTextColor(android.graphics.Color.parseColor("#6F8B84"))
             textSize = 11.5f
             setLineSpacing(3f, 1.25f)
@@ -255,7 +256,7 @@ class ControlActivity : AppCompatActivity() {
 
         // ---- AI 模型配置（直接在控制面板填，不用再进传图界面）----
         val aiTitle = TextView(this).apply {
-            text = "AI 模型（填了密钥才会真答题）"
+            text = "AI 模型（DeepSeek 只读文字；Kimi / 通义 / OpenAI 还能看图认字）"
             setTextColor(android.graphics.Color.parseColor("#6F8B84"))
             textSize = 12f
             setPadding(0, 24, 0, 8)
@@ -355,20 +356,9 @@ class ControlActivity : AppCompatActivity() {
             setBackgroundColor(android.graphics.Color.parseColor("#203330"))
             setOnClickListener { cfg.clearLog(); refreshLog() }
         }
-        val btnManual = Button(this).apply {
-            text = "手动传图答题 →"
-            isAllCaps = false
-            textSize = 12f
-            setTextColor(android.graphics.Color.parseColor("#AEC5BE"))
-            setBackgroundColor(android.graphics.Color.parseColor("#203330"))
-            setOnClickListener { startActivity(Intent(this@ControlActivity, MainActivity::class.java)) }
-        }
-        val bottomRow = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.HORIZONTAL
-            addView(btnClear, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(0, 0, 10, 0) })
-            addView(btnManual, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(10, 0, 0, 0) })
-        }
-        root.addView(bottomRow, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 16 })
+        root.addView(btnClear, android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 16 })
 
         swBorder.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
@@ -529,8 +519,9 @@ class ControlActivity : AppCompatActivity() {
             }
             else -> {
                 text = "✓✓ 全部就绪！直接切到题库 App 就行——\n" +
-                       "退出本界面后，屏幕右侧会挂一粒「屏知」悬浮球：点它可开始/暂停、识屏一次，\n" +
-                       "不用再回 App。答案会自动浮出，开了「自动操控」还会自己点选项。"
+                       "退出本界面后，屏幕右侧挂一粒「屏知」悬浮球，点开有四项：\n" +
+                       "⚡ 识屏作答 / ◎ 自动作答开关 / 暂停 / 面板。\n" +
+                       "把「自动作答」打开，答案一出来它自己就点上去。"
                 color = "#5DCAA5"
             }
         }
