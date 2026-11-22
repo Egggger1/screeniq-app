@@ -66,6 +66,7 @@ class ScreenReadService : AccessibilityService() {
         cfg.setServiceConnected(true)
         cfg.appendLog("[服务] 无障碍读屏服务已连接")
         postNotification()
+        main.post { if (cfg.autoRead() && cfg.globalBorder()) RunningBorderOverlay.show(this) }
         broadcastState(true)
         main.post { android.widget.Toast.makeText(this, "屏知读屏服务已连接", android.widget.Toast.LENGTH_SHORT).show() }
     }
@@ -207,12 +208,14 @@ class ScreenReadService : AccessibilityService() {
     override fun onInterrupt() {
         running = false
         cfg.setServiceConnected(false)
+        RunningBorderOverlay.hide()
         broadcastState(false)
     }
 
     override fun onDestroy() {
         running = false
         cfg.setServiceConnected(false)
+        RunningBorderOverlay.hide()
         broadcastState(false)
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(1001)
         AnswerOverlay.hide()
