@@ -1,8 +1,6 @@
 package com.screeniq.app
 
-import android.accessibilityservice.AccessibilityServiceInfo
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -11,7 +9,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import android.view.accessibility.AccessibilityManager
 import android.widget.Button
 import android.widget.ScrollView
 import android.widget.Switch
@@ -28,6 +25,7 @@ class ControlActivity : AppCompatActivity() {
 
     private lateinit var cfg: ConfigStore
     private lateinit var tvService: TextView
+    private lateinit var tvConn: TextView
     private lateinit var tvOverlay: TextView
     private lateinit var swRead: Switch
     private lateinit var swOverlay: Switch
@@ -103,12 +101,14 @@ class ControlActivity : AppCompatActivity() {
         root.addView(subtitle)
 
         // ---- 权限状态卡 ----
-        tvService = TextView(this).apply { textSize = 13f; setTextColor(android.graphics.Color.parseColor("#DDE5E1")); setPadding(24, 20, 24, 10) }
-        tvOverlay = TextView(this).apply { textSize = 13f; setTextColor(android.graphics.Color.parseColor("#DDE5E1")); setPadding(24, 6, 24, 20) }
+        tvService = TextView(this).apply { textSize = 13f; setTextColor(android.graphics.Color.parseColor("#DDE5E1")); setPadding(24, 18, 24, 6) }
+        tvConn = TextView(this).apply { textSize = 13f; setTextColor(android.graphics.Color.parseColor("#DDE5E1")); setPadding(24, 6, 24, 6) }
+        tvOverlay = TextView(this).apply { textSize = 13f; setTextColor(android.graphics.Color.parseColor("#DDE5E1")); setPadding(24, 6, 24, 18) }
         val statusCard = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setBackgroundColor(android.graphics.Color.parseColor("#172724"))
             addView(tvService)
+            addView(tvConn)
             addView(tvOverlay)
         }
         root.addView(statusCard)
@@ -262,8 +262,13 @@ class ControlActivity : AppCompatActivity() {
     @SuppressLint("SetTextI18n")
     private fun refreshServiceState() {
         val enabled = isServiceEnabled()
-        tvService.text = if (enabled) "● 读屏权限：已开启" else "○ 读屏权限：未开启（点下方按钮）"
+        tvService.text = if (enabled) "● 读屏开关：已开启" else "○ 读屏开关：未开启（点下方按钮）"
         tvService.setTextColor(android.graphics.Color.parseColor(if (enabled) "#5DCAA5" else "#FFD98F"))
+        val connected = cfg.serviceConnected() && enabled
+        tvConn.text = if (connected) "● 服务连接：已连接，正在后台待命"
+                      else if (enabled) "○ 服务连接：未连接（开关刚开请等几秒，或锁屏再解锁）"
+                      else "○ 服务连接：未连接（先开读屏开关）"
+        tvConn.setTextColor(android.graphics.Color.parseColor(if (connected) "#5DCAA5" else "#FFD98F"))
         val ov = Settings.canDrawOverlays(this)
         tvOverlay.text = if (ov) "● 悬浮窗权限：已开启" else "○ 悬浮窗权限：未开启（点下方按钮）"
         tvOverlay.setTextColor(android.graphics.Color.parseColor(if (ov) "#5DCAA5" else "#FFD98F"))
@@ -274,6 +279,7 @@ class ControlActivity : AppCompatActivity() {
     @SuppressLint("SetTextI18n")
     private fun refreshGuide() {
         val readOn = isServiceEnabled()
+        val connected = cfg.serviceConnected() && readOn
         val ovOn = Settings.canDrawOverlays(this)
         val autoRead = cfg.autoRead()
         val text: String
@@ -289,13 +295,18 @@ class ControlActivity : AppCompatActivity() {
                        "回来后这里会自动变绿。"
                 color = "#FFD98F"
             }
+            !connected -> {
+                text = "读屏开关已开，但服务还没连上。系统刚开权限常要等几秒——\n" +
+                       "请锁屏再解锁一次，或把本 App 从后台划掉重开，再看「服务连接」是否变绿。"
+                color = "#FFD98F"
+            }
             !ovOn -> {
-                text = "还差悬浮窗权限：点「② 开启悬浮窗权限」并允许。\n" +
+                text = "读屏服务已连上。还差悬浮窗权限：点「② 开启悬浮窗权限」并允许。\n" +
                        "这个权限让答案能浮在题目上方。"
                 color = "#FFD98F"
             }
             !autoRead -> {
-                text = "✓ 两个权限都好了。现在把下面「自动识屏」开关打开，就算全部就绪。"
+                text = "✓ 权限和服务都好了。现在把下面「自动识屏」开关打开，就算全部就绪。"
                 color = "#8FD8FF"
             }
             else -> {
@@ -314,11 +325,22 @@ class ControlActivity : AppCompatActivity() {
         logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
+    /**
+     * 判断系统无障碍开关是否打开。
+     * 直接读 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES——这正是系统设置页显示"已开启/已关闭"
+     * 所依据的权威数据源。不要用 getEnabledAccessibilityServiceList(FEEDBACK_GENERIC)：
+     * 那套查询带反馈类型过滤、且各 ROM 实现不一（荣耀 MagicOS 上尤其查不到），
+     * 会出现"系统开了、App 误判没开"的假阴性。
+     */
     private fun isServiceEnabled(): Boolean {
-        val am = getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
-        val list = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_GENERIC)
-        return list.any { it.resolveInfo.serviceInfo.packageName == packageName &&
-            it.resolveInfo.serviceInfo.name == ScreenReadService::class.java.name }
+        val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
+        val target = "$packageName/${ScreenReadService::class.java.name}"
+        return enabled.split(':').any { entry ->
+            // 兼容两种写法：com.x/com.x.Svc 与 com.x/.Svc
+            entry.equals(target, ignoreCase = true) ||
+            (entry.contains(packageName, ignoreCase = true) && entry.substringAfter('/').trimStart('.').equals(
+                ScreenReadService::class.java.simpleName, ignoreCase = true))
+        }
     }
 
     private fun openAccessibilitySettings() {
