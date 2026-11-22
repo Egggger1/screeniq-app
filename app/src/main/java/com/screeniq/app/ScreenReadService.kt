@@ -412,7 +412,9 @@ class ScreenReadService : AccessibilityService() {
                     lastOcrLines = lines
                     cfg.appendLog(
                         if (lines.isEmpty()) "[读图] 截图成功，但没认出文字（${bmp.width}×${bmp.height}）"
-                        else "[读图] 认出 ${lines.size} 行"
+                        else "[读图] 认出 ${lines.size} 行" +
+                            if (manual) "：" + lines.take(6).joinToString(" / ") { it.text.take(10) }
+                            else ""
                     )
                     if (lines.isNotEmpty()) {
                         val merged = mergeText(text, lines.joinToString("\n") { it.text })
@@ -664,10 +666,11 @@ class ScreenReadService : AccessibilityService() {
         delay(TAP_VERIFY_DELAY_MS)
         var changed = screenChanged(sigBefore)
 
-        // 没变化就原地补一次：**同一个点**再戳一下，不会误点到别的选项
+        // 没变化就原地补一次：**同一个点**再戳一下，不会误点到别的选项。
+        // 这里强制走手势——有些 H5 控件 performAction 会返回 true 但其实什么都没发生。
         if (!changed) {
-            cfg.appendLog("[操控] 页面没变化，原地补点一次")
-            tapTarget(target)
+            cfg.appendLog("[操控] 页面没变化，改用真实触摸原地补点")
+            tapAt(target.x, target.y)
             delay(700)
             changed = screenChanged(sigBefore)
         }
