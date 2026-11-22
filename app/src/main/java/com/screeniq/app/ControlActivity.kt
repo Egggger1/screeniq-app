@@ -200,6 +200,45 @@ class ControlActivity : AppCompatActivity() {
             cfg.setExplain(v)
         }
 
+        // ---- 排障：立刻识屏试一次（不用等屏幕变化自己触发）----
+        val btnTry = Button(this).apply {
+            text = "⚡ 立刻识屏试一次"
+            isAllCaps = false
+            textSize = 13f
+            setTextColor(android.graphics.Color.parseColor("#A3E8D8"))
+            setBackgroundColor(android.graphics.Color.parseColor("#1F3A35"))
+            setOnClickListener {
+                if (!isServiceEnabled() || !cfg.serviceConnected()) {
+                    Toast.makeText(
+                        this@ControlActivity,
+                        "读屏服务还没连上：先开读屏权限，等「服务连接」变绿再试",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    // 留 4 秒给你切到题目页，到点它会读当前屏幕并作答
+                    sendBroadcast(
+                        Intent(ScreenReadService.ACTION_READ_NOW)
+                            .setPackage(packageName)
+                            .putExtra(ScreenReadService.EXTRA_DELAY, 4000L)
+                    )
+                    Toast.makeText(this@ControlActivity, "4 秒后读屏，现在切到题目页面", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+        root.addView(btnTry, android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 16 })
+
+        val tryTip = TextView(this).apply {
+            text = "点了之后 4 秒内切到题目页。它会立刻读一次屏并把每一步写进下面的日志——" +
+                   "「读题」= 读到了；「跳过」= 判定不是题目；「失败」= 密钥/网络问题。"
+            setTextColor(android.graphics.Color.parseColor("#6F8B84"))
+            textSize = 11.5f
+            setLineSpacing(3f, 1.25f)
+            setPadding(0, 8, 0, 0)
+        }
+        root.addView(tryTip)
+
         // ---- AI 模型配置（直接在控制面板填，不用再进传图界面）----
         val aiTitle = TextView(this).apply {
             text = "AI 模型（填了密钥才会真答题）"

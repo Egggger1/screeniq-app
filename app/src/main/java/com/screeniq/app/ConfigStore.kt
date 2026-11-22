@@ -59,13 +59,16 @@ class ConfigStore(context: Context) {
         notifyLogChanged()
     }
 
-    fun save(provider: String, apiKey: String, baseUrl: String, model: String) {
+    fun save(newProvider: String, apiKey: String, baseUrl: String, model: String) {
+        val oldProvider = this.provider()
         sp.edit {
-            putString("provider", provider)
+            putString("provider", newProvider)
             // 空字符串表示"不改动密钥"，避免界面打码值覆盖真密钥
             if (apiKey.isNotBlank()) putString("api_key", apiKey.trim())
             if (baseUrl.isNotBlank()) putString("base_url", baseUrl.trim())
+            else if (oldProvider != newProvider) remove("base_url")   // 换模型要清掉旧接口地址，否则会拿新钥匙敲旧门
             if (model.isNotBlank()) putString("model", model.trim())
+            else if (oldProvider != newProvider) remove("model")
         }
     }
 

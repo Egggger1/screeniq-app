@@ -11,8 +11,8 @@ android {
         applicationId = "com.screeniq.app"
         minSdk = 23          // 覆盖 Android 6.0+，荣耀绝大多数机型
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.2.3-面板配置与光边框"
+        versionCode = 5
+        versionName = "0.2.4-识别与防误触"
     }
 
     buildTypes {
