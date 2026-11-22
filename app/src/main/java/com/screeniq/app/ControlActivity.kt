@@ -9,8 +9,13 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.text.InputType
+import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
@@ -34,6 +39,11 @@ class ControlActivity : AppCompatActivity() {
     private lateinit var tvLog: TextView
     private lateinit var logScroll: ScrollView
     private lateinit var tvGuide: TextView
+    private lateinit var flowBorder: FlowBorderView
+    private lateinit var spProvider: Spinner
+    private lateinit var etKey: EditText
+    private lateinit var tvAiStatus: TextView
+    private lateinit var swBorder: Switch
     private var initializing = true   // 抑制初始化时开关回调
 
     private val stateReceiver = object : BroadcastReceiver() {
@@ -57,6 +67,7 @@ class ControlActivity : AppCompatActivity() {
         cfg = ConfigStore(this)
         buildUi()
         syncSwitches()
+        refreshAiStatus()
         refreshServiceState()
         refreshLog()
         requestNotificationPermissionIfNeeded()
@@ -166,6 +177,7 @@ class ControlActivity : AppCompatActivity() {
                 Toast.makeText(this, "请先点上面的「开启读屏权限」", Toast.LENGTH_LONG).show()
             }
             refreshGuide()
+            syncBorders()
         }
         swOverlay.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
@@ -188,6 +200,81 @@ class ControlActivity : AppCompatActivity() {
             cfg.setExplain(v)
         }
 
+        // ---- AI 模型配置（直接在控制面板填，不用再进传图界面）----
+        val aiTitle = TextView(this).apply {
+            text = "AI 模型（填了密钥才会真答题）"
+            setTextColor(android.graphics.Color.parseColor("#6F8B84"))
+            textSize = 12f
+            setPadding(0, 24, 0, 8)
+        }
+        root.addView(aiTitle)
+
+        val aiCard = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setBackgroundColor(android.graphics.Color.parseColor("#172724"))
+            setPadding(24, 18, 24, 18)
+        }
+
+        spProvider = Spinner(this).apply {
+            val names = Providers.list.map { it["name"] as String }
+            adapter = object : ArrayAdapter<String>(
+                this@ControlActivity, android.R.layout.simple_spinner_item, names
+            ) {
+                override fun getView(position: Int, convertView: android.view.View?, parent: android.view.ViewGroup): android.view.View {
+                    val tv = super.getView(position, convertView, parent) as TextView
+                    tv.setTextColor(android.graphics.Color.parseColor("#DDE5E1"))
+                    tv.textSize = 13f
+                    return tv
+                }
+                override fun getDropDownView(position: Int, convertView: android.view.View?, parent: android.view.ViewGroup): android.view.View {
+                    val tv = super.getDropDownView(position, convertView, parent) as TextView
+                    tv.setTextColor(android.graphics.Color.parseColor("#DDE5E1"))
+                    tv.setBackgroundColor(android.graphics.Color.parseColor("#1F3A35"))
+                    tv.textSize = 13f
+                    tv.setPadding(dp(18), dp(14), dp(18), dp(14))
+                    return tv
+                }
+            }
+            val idx = Providers.list.indexOfFirst { it["id"] == cfg.provider() }
+            if (idx >= 0) setSelection(idx)
+        }
+        aiCard.addView(spProvider, android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        etKey = EditText(this).apply {
+            hint = "粘贴 API Key（已填过的会保留，留空即不修改）"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            textSize = 13f
+            setTextColor(android.graphics.Color.parseColor("#DDE5E1"))
+            setHintTextColor(android.graphics.Color.parseColor("#6F8B84"))
+            setPadding(0, 18, 0, 18)
+        }
+        aiCard.addView(etKey)
+
+        val btnSaveKey = Button(this).apply {
+            text = "保存模型配置"
+            isAllCaps = false
+            textSize = 13f
+            setTextColor(android.graphics.Color.parseColor("#003831"))
+            setBackgroundColor(android.graphics.Color.parseColor("#A3E8D8"))
+            setOnClickListener { saveAiConfig() }
+        }
+        aiCard.addView(btnSaveKey)
+
+        tvAiStatus = TextView(this).apply {
+            textSize = 12f
+            setLineSpacing(3f, 1.15f)
+            setPadding(0, 14, 0, 0)
+        }
+        aiCard.addView(tvAiStatus)
+        root.addView(aiCard, android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+            android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        // ---- 全局运行光边框开关 ----
+        swBorder = makeSwitch(root, "全局运行光线边框（切到任意 App 可见）")
+
         // ---- 日志 ----
         val logTitle = TextView(this).apply {
             text = "读屏日志（最近 30 条）"
@@ -202,7 +289,8 @@ class ControlActivity : AppCompatActivity() {
             setLineSpacing(4f, 1.15f)
         }
         logScroll = ScrollView(this).apply { addView(tvLog) }
-        root.addView(logScroll, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(logScroll, android.widget.LinearLayout.LayoutParams(
+            android.widget.LinearLayout.LayoutParams.MATCH_PARENT, dp(220)))
 
         // ---- 底部按钮 ----
         val btnClear = Button(this).apply {
@@ -228,7 +316,62 @@ class ControlActivity : AppCompatActivity() {
         }
         root.addView(bottomRow, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 16 })
 
-        setContentView(root)
+        swBorder.setOnCheckedChangeListener { _, v ->
+            if (initializing) return@setOnCheckedChangeListener
+            cfg.setGlobalBorder(v)
+            syncBorders()
+        }
+
+        // ---- 组装：可滚动内容 + 最上层流动光边框 ----
+        val contentScroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(root)
+        }
+        val frame = FrameLayout(this).apply {
+            setBackgroundColor(android.graphics.Color.parseColor("#091312"))
+            addView(contentScroll, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        }
+        flowBorder = FlowBorderView(this)
+        // 边框叠在内容之上但绝不拦截触摸（FlowBorderView.onTouchEvent 恒 false）
+        frame.addView(flowBorder, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+        setContentView(frame)
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    /** 保存 AI 配置；密钥留空表示不修改已存值。 */
+    private fun saveAiConfig() {
+        val pid = Providers.list.getOrNull(spProvider.selectedItemPosition)?.get("id") as? String ?: "deepseek"
+        val key = etKey.text.toString().trim()
+        cfg.save(pid, key, "", "")
+        etKey.setText("")
+        Toast.makeText(this, if (key.isBlank()) "模型已切换（密钥未改动）" else "已保存，切到题库 App 即可真答题", Toast.LENGTH_SHORT).show()
+        refreshAiStatus()
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun refreshAiStatus() {
+        val key = cfg.apiKey()
+        val p = Providers.find(cfg.provider())
+        val name = p?.get("name") ?: cfg.provider()
+        if (key.isBlank()) {
+            tvAiStatus.text = "当前：$name · 未填密钥（先用假答题演示）"
+            tvAiStatus.setTextColor(android.graphics.Color.parseColor("#FFD98F"))
+        } else {
+            val masked = if (key.length >= 8) "${key.take(4)}••••${key.takeLast(4)}" else "••••"
+            tvAiStatus.text = "当前：$name · 已配置 $masked"
+            tvAiStatus.setTextColor(android.graphics.Color.parseColor("#5DCAA5"))
+        }
+    }
+
+    /** 同步边框动画：服务连上且自动识屏开着才动；全局光边框按开关显示。 */
+    private fun syncBorders() {
+        val running = isServiceEnabled() && cfg.serviceConnected() && cfg.autoRead()
+        flowBorder.setActive(running)
+        if (running && cfg.globalBorder()) RunningBorderOverlay.show(this) else RunningBorderOverlay.hide()
     }
 
     private fun makeSwitch(parent: android.widget.LinearLayout, label: String): Switch {
@@ -256,6 +399,7 @@ class ControlActivity : AppCompatActivity() {
         swOverlay.isChecked = cfg.overlay()
         swAction.isChecked = cfg.autoAction()
         swExplain.isChecked = cfg.explain()
+        swBorder.isChecked = cfg.globalBorder()
         initializing = false
     }
 
@@ -273,6 +417,7 @@ class ControlActivity : AppCompatActivity() {
         tvOverlay.text = if (ov) "● 悬浮窗权限：已开启" else "○ 悬浮窗权限：未开启（点下方按钮）"
         tvOverlay.setTextColor(android.graphics.Color.parseColor(if (ov) "#5DCAA5" else "#FFD98F"))
         refreshGuide()
+        syncBorders()
     }
 
     /** 动态引导：明确告诉用户「现在到第几步、接下来做什么」，把权限→开关→切后台串成一条线。 */
