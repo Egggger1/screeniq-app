@@ -44,11 +44,13 @@ class ControlActivity : AppCompatActivity() {
     private lateinit var etKey: EditText
     private lateinit var tvAiStatus: TextView
     private lateinit var swBorder: Switch
+    private lateinit var swBubble: Switch
     private var initializing = true   // 抑制初始化时开关回调
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             refreshServiceState()
+            applySwitches()
         }
     }
     private val logReceiver = object : BroadcastReceiver() {
@@ -83,7 +85,18 @@ class ControlActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        AppVisible.foreground = true
+        ControlBubble.hide()      // 面板在前台时不需要悬浮球，避免两套入口打架
         refreshServiceState()
+        applySwitches()           // 悬浮球上按过开始/暂停后，面板里的开关要跟着变
+    }
+
+    override fun onPause() {
+        AppVisible.foreground = false
+        // 退出面板 = 自动变成悬浮球，之后开始/暂停都不用再回 App
+        if (cfg.bubble() && ScreenReadService.instance != null) ControlBubble.show(this)
+        else ControlBubble.hide()
+        super.onPause()
     }
 
     @SuppressLint("SetTextI18n")
@@ -167,7 +180,7 @@ class ControlActivity : AppCompatActivity() {
         // ---- 四个开关 ----
         swRead = makeSwitch(root, "自动识屏（后台读题并作答）")
         swOverlay = makeSwitch(root, "悬浮窗就地显示答案")
-        swAction = makeSwitch(root, "自动操控（自动点选答案 · 默认关）")
+        swAction = makeSwitch(root, "自动操控（答案一到就自动点选 · 默认关）")
         swExplain = makeSwitch(root, "详细解释（答案 + 解题步骤）")
 
         swRead.setOnCheckedChangeListener { _, v ->
@@ -192,7 +205,7 @@ class ControlActivity : AppCompatActivity() {
         swAction.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
             cfg.setAutoAction(v)
-            if (v) Toast.makeText(this, "自动操控已开启：会尝试自动点选答案。只在自己练习时使用。", Toast.LENGTH_LONG).show()
+            if (v) Toast.makeText(this, "自动操控已开启：答案一出来就会自动点选对应选项。只在自己练习时使用。", Toast.LENGTH_LONG).show()
             refreshGuide()
         }
         swExplain.setOnCheckedChangeListener { _, v ->
@@ -312,8 +325,9 @@ class ControlActivity : AppCompatActivity() {
             android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
             android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
 
-        // ---- 全局运行光边框开关 ----
+        // ---- 全局运行光边框 + 常驻悬浮球 ----
         swBorder = makeSwitch(root, "全局运行光线边框（切到任意 App 可见）")
+        swBubble = makeSwitch(root, "退出后显示悬浮球（开始 / 暂停 / 识屏）")
 
         // ---- 日志 ----
         val logTitle = TextView(this).apply {
@@ -360,6 +374,20 @@ class ControlActivity : AppCompatActivity() {
             if (initializing) return@setOnCheckedChangeListener
             cfg.setGlobalBorder(v)
             syncBorders()
+        }
+
+        swBubble.setOnCheckedChangeListener { _, v ->
+            if (initializing) return@setOnCheckedChangeListener
+            cfg.setBubble(v)
+            if (v) {
+                if (!Settings.canDrawOverlays(this)) {
+                    requestOverlayPermission()
+                } else if (ScreenReadService.instance != null && !AppVisible.foreground) {
+                    ControlBubble.show(this)
+                }
+            } else {
+                ControlBubble.hide()
+            }
         }
 
         // ---- 组装：可滚动内容 + 最上层流动光边框 ----
@@ -434,14 +462,19 @@ class ControlActivity : AppCompatActivity() {
         return sw
     }
 
-    private fun syncSwitches() {
+    /** 从配置回填所有开关。initializing 期间屏蔽回调，避免"回填"被当成"用户操作"。 */
+    private fun applySwitches() {
+        initializing = true
         swRead.isChecked = cfg.autoRead()
         swOverlay.isChecked = cfg.overlay()
         swAction.isChecked = cfg.autoAction()
         swExplain.isChecked = cfg.explain()
         swBorder.isChecked = cfg.globalBorder()
+        swBubble.isChecked = cfg.bubble()
         initializing = false
     }
+
+    private fun syncSwitches() = applySwitches()
 
     @SuppressLint("SetTextI18n")
     private fun refreshServiceState() {
@@ -495,8 +528,9 @@ class ControlActivity : AppCompatActivity() {
                 color = "#8FD8FF"
             }
             else -> {
-                text = "✓✓ 全部就绪！现在直接切到你的题库 App 就行——\n" +
-                       "这个界面可以放后台、也可以划掉关掉。切过去后答案会自动浮出来，日志会记在这里。"
+                text = "✓✓ 全部就绪！直接切到题库 App 就行——\n" +
+                       "退出本界面后，屏幕右侧会挂一粒「屏知」悬浮球：点它可开始/暂停、识屏一次，\n" +
+                       "不用再回 App。答案会自动浮出，开了「自动操控」还会自己点选项。"
                 color = "#5DCAA5"
             }
         }

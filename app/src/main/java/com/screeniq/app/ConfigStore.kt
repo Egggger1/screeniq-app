@@ -46,6 +46,10 @@ class ConfigStore(context: Context) {
     fun globalBorder(): Boolean = sp.getBoolean("global_border", true)
     fun setGlobalBorder(v: Boolean) = sp.edit { putBoolean("global_border", v) }
 
+    /** 常驻控制悬浮球：退出 App 后靠它开始/暂停，不用再回面板。默认开 */
+    fun bubble(): Boolean = sp.getBoolean("bubble", true)
+    fun setBubble(v: Boolean) = sp.edit { putBoolean("bubble", v) }
+
     /** 读屏日志（诊断用，最近若干条），只存文字摘要不存屏幕内容全文 */
     fun log(): String = sp.getString("read_log", "") ?: ""
     fun appendLog(line: String) {

@@ -11,8 +11,8 @@ android {
         applicationId = "com.screeniq.app"
         minSdk = 23          // 覆盖 Android 6.0+，荣耀绝大多数机型
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.2.5-自动触发提速"
+        versionCode = 7
+        versionName = "0.2.6-自动点选与悬浮球"
     }
 
     buildTypes {

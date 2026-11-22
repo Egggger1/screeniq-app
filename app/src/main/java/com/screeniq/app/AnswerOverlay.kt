@@ -35,6 +35,7 @@ object AnswerOverlay {
     private var card: LinearLayout? = null
     private var pill: TextView? = null
     private var answerView: TextView? = null
+    private var headerView: TextView? = null
     private var lp: WindowManager.LayoutParams? = null
 
     private val main = Handler(Looper.getMainLooper())
@@ -47,7 +48,7 @@ object AnswerOverlay {
     private const val AUTO_COLLAPSE_MS = 30_000L
     private const val AUTO_HIDE_MS = 120_000L
 
-    fun show(context: Context, answer: String, allowAutoClick: Boolean, onAutoClick: () -> Unit) {
+    fun show(context: Context, answer: String, allowAutoClick: Boolean, onAutoClick: () -> String) {
         val app = context.applicationContext
         if (!Settings.canDrawOverlays(app)) return
         main.post {
@@ -95,9 +96,10 @@ object AnswerOverlay {
                 textSize = 13f
                 setPadding(0, dpi(app, 4), 0, dpi(app, 6))
             }
+            headerView = header
 
             val ans = TextView(app).apply {
-                text = answer
+                text = stripMd(answer)
                 setTextColor(Color.parseColor("#EAF2EF"))
                 textSize = 15f
                 setLineSpacing(dpi(app, 3).toFloat(), 1.3f)
@@ -117,7 +119,7 @@ object AnswerOverlay {
             c.addView(scroller, scrollerLp)
 
             // 内容太高就限高滚动，别把下半屏吃掉
-            val maxH = (dm.heightPixels * 0.30f).toInt()
+            val maxH = (dm.heightPixels * 0.26f).toInt()
             scroller.post {
                 val inner = scroller.getChildAt(0)?.height ?: 0
                 if (inner > maxH) {
@@ -138,7 +140,12 @@ object AnswerOverlay {
                     gravity = Gravity.CENTER
                     setPadding(dpi(app, 12), dpi(app, 9), dpi(app, 12), dpi(app, 9))
                     background = rounded(app, Color.parseColor("#A3E8D8"), 12f)
-                    setOnClickListener { onAutoClick(); collapse() }
+                    setOnClickListener {
+                        // 现在会把"点了没点到"的原因回显到标题，不再点了没反应
+                        val msg = runCatching { onAutoClick() }.getOrDefault("点选失败")
+                        noteFeedback(msg)
+                        main.postDelayed({ collapse() }, 1800)
+                    }
                 }
                 btnRow.addView(autoBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                     .apply { marginEnd = dpi(app, 8) })
@@ -235,6 +242,27 @@ object AnswerOverlay {
         main.post { removeSelf() }
     }
 
+    /** 识别到题、还没拿到答案时的占位卡：让"正在动"这件事立刻可见，不用干等。 */
+    fun showThinking(context: Context) {
+        show(context, "正在问 AI…", false) { "" }
+    }
+
+    /** 自动点选的结果回显到标题（成功/没找到都看得见，不再"点了像没点"）。 */
+    fun noteFeedback(msg: String) {
+        val h = headerView ?: return
+        main.post {
+            h.text = if (msg.startsWith("已")) "◈  $msg" else "◈  $msg（详见日志）"
+            h.setTextColor(Color.parseColor(if (msg.startsWith("已")) "#5DCAA5" else "#FFD98F"))
+        }
+    }
+
+    private fun stripMd(s: String): String = s
+        .replace("**", "")
+        .replace("__", "")
+        .replace("`", "")
+        .replace(Regex("^#{1,6}\\s*", RegexOption.MULTILINE), "")
+        .replace(Regex("^\\s*[-*]\\s+", RegexOption.MULTILINE), "· ")
+
     /** 同步移除，避免"先 post 再 add"导致刚显示的窗口立刻被删掉。 */
     private fun removeSelf() {
         collapseRunnable?.let { main.removeCallbacks(it) }
@@ -246,6 +274,7 @@ object AnswerOverlay {
         card = null
         pill = null
         answerView = null
+        headerView = null
     }
 
     /** 拖动手柄：按住移动窗口；轻点则执行 onClick（胶囊=展开，标题栏=收起）。 */
