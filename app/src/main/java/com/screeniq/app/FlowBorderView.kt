@@ -72,8 +72,8 @@ class FlowBorderView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val inset = strokeWidth / 2f + dp(1f)
-        val rect = RectF(inset, inset, width - inset, height - inset)
+        val inset = paint.strokeWidth / 2f + dp(1f)
+        val rect = RectF(inset, inset, width.toFloat() - inset, height.toFloat() - inset)
         val radius = dp(18f)
 
         if (!active) {
