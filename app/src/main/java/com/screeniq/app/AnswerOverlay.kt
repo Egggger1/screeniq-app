@@ -44,8 +44,8 @@ object AnswerOverlay {
     private var cardW = 0
     private var topY = 0
 
-    private const val AUTO_COLLAPSE_MS = 15_000L
-    private const val AUTO_HIDE_MS = 90_000L
+    private const val AUTO_COLLAPSE_MS = 30_000L
+    private const val AUTO_HIDE_MS = 120_000L
 
     fun show(context: Context, answer: String, allowAutoClick: Boolean, onAutoClick: () -> Unit) {
         val app = context.applicationContext
@@ -217,9 +217,10 @@ object AnswerOverlay {
         p.visibility = View.VISIBLE
         val params = lp ?: return
         params.width = WindowManager.LayoutParams.WRAP_CONTENT
-        params.gravity = Gravity.TOP or Gravity.END
-        params.x = dpi(host?.context ?: return, 12)
-        params.y = topY
+        // 收成右侧中部的小胶囊：不压标题栏按钮、不压底部导航，几乎不可能误触
+        params.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        params.x = dp(host?.context ?: return, 8)
+        params.y = 0
         runCatching { wm?.updateViewLayout(host, params) }
         collapseRunnable?.let { main.removeCallbacks(it) }
     }

@@ -25,12 +25,17 @@ import kotlinx.coroutines.withContext
 /**
  * 后台自动识屏核心服务。
  *
- * 流程：屏幕变化 → 取字（无障碍节点优先，读不到用截图 OCR 兜底）
- *      → 粗筛（看有没有"题干 + 选项"的结构）→ 送 AI（AI 再判一次是不是题）
- *      → 悬浮窗就地显示答案 →（可选）自动点选。
+ * 触发有三条通道，确保"不用手点也会自己工作"：
+ *  1. 无障碍事件（页面切换、内容变化、滚动）→ 延迟 350ms 等渲染稳定再读；
+ *  2. 稳定重试：读到空白/半截内容时，隔 600~1200ms 再读一次，最多 3 轮；
+ *  3. 低频巡检：每 3 秒轻量比对一次屏幕指纹，变了就完整读一次
+ *     —— 专治"页面静止后 App 不再发事件"。
  *
- * 合规设计：自动识屏/自动操控都是客户端开关，默认关闭，用户手动开启才生效；
- * 程序不判断使用场景；屏幕内容只在内存处理，不落盘、不上传，日志只记摘要。
+ * 取字两层：无障碍节点优先（快），读不到"题干+选项"结构时用截图 OCR 兜底。
+ * 判题两层：本地粗筛（结构/关键词）+ 模型二次确认（答 NONE 就不弹窗）。
+ *
+ * 合规：自动识屏/自动操控都是客户端开关，默认关闭，用户手动开启才生效；
+ * 程序不判断使用场景；屏幕内容只在内存处理，不落盘、不上传。
  */
 class ScreenReadService : AccessibilityService() {
 
@@ -45,12 +50,14 @@ class ScreenReadService : AccessibilityService() {
     private var lastFingerprint = ""
     private var lastAskAt = 0L
     private var lastAttemptAt = 0L
+    private var lastEventAt = 0L
     private var busy = false
+    private var heartbeat: Runnable? = null
 
     private val cmdReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
             if (intent?.action == ACTION_READ_NOW) {
-                // 手动"立刻试一次"：清掉去重和节流，强制读当前屏
+                // 手动"立刻试一次"：清掉去重和冷却，强制读当前屏
                 lastFingerprint = ""
                 lastAskAt = 0
                 lastAttemptAt = 0
@@ -71,8 +78,13 @@ class ScreenReadService : AccessibilityService() {
         const val EXTRA_DELAY = "delay_ms"
 
         private const val CHANNEL_ID = "screeniq_read_channel"
-        private const val MIN_ASK_INTERVAL_MS = 3000L     // 两次答题最短间隔
-        private const val MIN_ATTEMPT_INTERVAL_MS = 700L  // 事件风暴节流
+
+        private const val MIN_ASK_INTERVAL_MS = 1200L      // 两次答题最短间隔（靠指纹去重，不用太长）
+        private const val MIN_ATTEMPT_INTERVAL_MS = 400L   // 事件风暴节流
+        private const val FAIL_COOLDOWN_MS = 6000L         // 失败后同一屏的冷却，避免狂刷接口
+        private const val SETTLE_DELAY_MS = 350L           // 事件后等页面渲染稳定
+        private const val HEARTBEAT_MS = 3000L             // 巡检周期
+        private const val MAX_ATTEMPTS = 3                 // 一轮最多读几次
         private const val MIN_TEXT_LEN = 6
         private const val MAX_QUESTION_CHARS = 1600
     }
@@ -88,12 +100,11 @@ class ScreenReadService : AccessibilityService() {
         super.onServiceConnected()
         serviceInfo = serviceInfo.apply {
             flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-            // 界面内容变化、滚动、点击后状态变化都要能收到，否则答完一题就不再触发
             eventTypes = AccessibilityEvent.TYPES_ALL_MASK
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
         }
         cfg.setServiceConnected(true)
-        cfg.appendLog("[服务] 读屏服务已连接")
+        cfg.appendLog("[服务] 读屏服务已连接，开始自动待命")
         postNotification()
 
         runCatching {
@@ -103,9 +114,8 @@ class ScreenReadService : AccessibilityService() {
             )
         }
 
-        main.post {
-            if (cfg.autoRead() && cfg.globalBorder()) RunningBorderOverlay.show(this)
-        }
+        startHeartbeat()
+        if (cfg.autoRead() && cfg.globalBorder()) RunningBorderOverlay.show(this)
         broadcastState(true)
         main.post {
             android.widget.Toast.makeText(this, "屏知读屏服务已连接", android.widget.Toast.LENGTH_SHORT).show()
@@ -115,99 +125,172 @@ class ScreenReadService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         if (!cfg.autoRead()) return
-        // 不读自己 App 的界面，避免自我触发
         if (event.packageName?.toString() == packageName) return
-        // 锁屏状态不读，防止把锁屏/通知栏当题目
         val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
         if (km?.isKeyguardLocked == true) return
 
-        readOnce(allowOcr = true, manual = false)
+        lastEventAt = System.currentTimeMillis()
+        // 不立刻读：给页面一点渲染时间，减少"读到半截"
+        main.postDelayed({ readOnce(allowOcr = true, manual = false) }, SETTLE_DELAY_MS)
+    }
+
+    /**
+     * 低频巡检：App 不再发事件时（页面静止、WebView 不触发），靠它发现新题。
+     * 只做"取节点文字 + 比对指纹"，指纹没变就几乎零成本。
+     */
+    private fun startHeartbeat() {
+        if (heartbeat != null) return
+        val r = object : Runnable {
+            override fun run() {
+                runCatching {
+                    val now = System.currentTimeMillis()
+                    // 事件还在流动就不用巡检，省电
+                    if (cfg.autoRead() && !busy && now - lastEventAt > 1500) {
+                        val root = rootInActiveWindow
+                        val t = collectText(root).trim()
+                        if (t.length >= MIN_TEXT_LEN && fingerprint(t) != lastFingerprint) {
+                            if (now - lastAttemptAt >= MIN_ATTEMPT_INTERVAL_MS &&
+                                now - lastAskAt >= 0
+                            ) {
+                                readOnce(allowOcr = true, manual = false)
+                            }
+                        }
+                    }
+                }
+                main.postDelayed(this, HEARTBEAT_MS)
+            }
+        }
+        heartbeat = r
+        main.postDelayed(r, HEARTBEAT_MS)
+    }
+
+    private fun stopHeartbeat() {
+        heartbeat?.let { main.removeCallbacks(it) }
+        heartbeat = null
     }
 
     /**
      * 读一次当前屏幕并尝试作答。
      * @param allowOcr 节点文字不够时是否允许截图 OCR 兜底
-     * @param manual  是否是用户手动点"立刻试一次"（跳过总开关与节流）
+     * @param manual  用户手动点的"立刻试一次"（跳过总开关与节流，且不自动重试）
+     * @param attempt 本轮第几次尝试（用于稳定重试）
+     * @param force   重试时跳过冷却检查
      */
-    private fun readOnce(allowOcr: Boolean, manual: Boolean) {
+    private fun readOnce(
+        allowOcr: Boolean,
+        manual: Boolean,
+        attempt: Int = 0,
+        force: Boolean = false
+    ) {
         if (!manual && !cfg.autoRead()) return
         if (busy) return
 
         val now = System.currentTimeMillis()
-        if (now - lastAttemptAt < MIN_ATTEMPT_INTERVAL_MS) return
-        if (now - lastAskAt < MIN_ASK_INTERVAL_MS) return
+        if (!force && !manual) {
+            if (now - lastAttemptAt < MIN_ATTEMPT_INTERVAL_MS) return
+            if (now - lastAskAt < MIN_ASK_INTERVAL_MS) return
+        }
         lastAttemptAt = now
 
         val root = runCatching { rootInActiveWindow }.getOrNull()
         val nodeText = runCatching { collectText(root) }.getOrDefault("").trim()
-        val optionCount = runCatching { countShortClickable(root) }.getOrDefault(0)
+        val shortTexts = runCatching { countShortTexts(root) }.getOrDefault(0)
         pendingRoot = root
 
         scope.launch {
-            var text = nodeText
-            var source = "节点"
-
-            // 节点没拿到"题干 + 选项"的结构时，用截图 OCR 补
-            val nodeUseful = text.length >= 20 && optionCount >= 2
-            if (!nodeUseful && allowOcr && ScreenshotOcr.supported &&
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
-            ) {
-                val ocr = runCatching { ScreenshotOcr.readScreen(this@ScreenReadService) }.getOrNull()
-                if (!ocr.isNullOrBlank() && ocr.length > text.length) {
-                    text = ocr
-                    source = "OCR"
-                }
-            }
-
-            text = text.trim()
-            if (text.length < MIN_TEXT_LEN) {
-                if (manual) {
-                    cfg.appendLog("[识屏] 没读到文字（节点 ${nodeText.length} 字）")
-                    postNotification("这次没读到屏幕文字，换个页面再试")
-                }
-                return@launch
-            }
-
-            val fp = fingerprint(text)
-            if (fp == lastFingerprint) return@launch
-            if (!looksLikeQuestion(text)) {
-                if (manual) {
-                    cfg.appendLog("[识屏] 读到 ${text.length} 字，但看着不是题目：${text.take(60).replace('\n', ' ')}")
-                    postNotification("读到 ${text.length} 字，但这不是题目")
-                }
-                return@launch
-            }
-
-            // 认下这道题，避免同一屏反复问
-            lastFingerprint = fp
-            lastAskAt = System.currentTimeMillis()
             busy = true
-            broadcastState(true)
+            try {
+                var text = nodeText
+                var source = "节点"
 
-            val preview = text.take(110).replace('\n', ' ')
-            cfg.appendLog("[读题·$source] $preview")
-            postNotification("读到题目，正在问 AI…")
+                // 节点里已经有"题干 + 若干短选项"就不用 OCR（省 1~2 秒）
+                val nodeUseful = text.length >= 12 && shortTexts >= 2
+                if (!nodeUseful && allowOcr && ScreenshotOcr.supported &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                ) {
+                    val ocr = runCatching { ScreenshotOcr.readScreen(this@ScreenReadService) }.getOrNull()
+                    if (!ocr.isNullOrBlank() && ocr.length > text.length) {
+                        text = ocr
+                        source = "OCR"
+                    }
+                }
+                text = text.trim()
 
-            val result = runCatching { ai.answer(buildQuestion(text), cfg.explain()) }
-                .getOrElse { AiResult("", "本地", false, "异常：${it.javaClass.simpleName}") }
-            busy = false
+                // --- 情况 1：文字太少，可能页面还没渲染完 ---
+                if (text.length < MIN_TEXT_LEN) {
+                    if (!manual && retryLater(allowOcr, attempt)) return@launch
+                    if (manual) {
+                        cfg.appendLog("[识屏] 没读到文字（节点 ${nodeText.length} 字）")
+                        postNotification("这次没读到屏幕文字，换个页面再试")
+                    }
+                    return@launch
+                }
 
-            val answer = result.answer.trim()
-            when {
-                !result.ok || answer.isBlank() -> {
-                    val why = result.note.ifBlank { "没有返回内容" }
-                    cfg.appendLog("[失败] $why")
-                    postNotification("这次没答出来：$why")
+                // --- 情况 2：内容没变，跳过 ---
+                val fp = fingerprint(text)
+                if (fp == lastFingerprint) return@launch
+
+                // --- 情况 3：粗筛不像题目 ---
+                if (!looksLikeQuestion(text)) {
+                    if (!manual && retryLater(allowOcr, attempt)) return@launch
+                    if (manual) {
+                        cfg.appendLog("[识屏] 读到 ${text.length} 字，但看着不是题目：${text.take(60).replace('\n', ' ')}")
+                        postNotification("读到 ${text.length} 字，但这不像题目")
+                    }
+                    return@launch
                 }
-                isNotAQuestion(answer) -> {
-                    cfg.appendLog("[跳过] 模型判断不是题目（可能是列表/聊天/广告页）")
+
+                cfg.appendLog("[读题·$source] ${text.take(110).replace('\n', ' ')}")
+                postNotification("读到题目，正在问 AI…")
+                if (!manual) {
+                    main.post {
+                        runCatching {
+                            android.widget.Toast.makeText(
+                                this@ScreenReadService, "屏知：读到题目，正在问 AI…",
+                                android.widget.Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
                 }
-                else -> {
-                    cfg.appendLog("[答案] ${answer.take(120).replace('\n', ' ')}")
-                    withContext(Dispatchers.Main) { showAnswer(answer) }
+                broadcastState(true)
+
+                val result = runCatching { ai.answer(buildQuestion(text), cfg.explain()) }
+                    .getOrElse { AiResult("", "本地", false, "异常：${it.javaClass.simpleName}") }
+                val answer = result.answer.trim()
+
+                when {
+                    !result.ok || answer.isBlank() -> {
+                        val why = result.note.ifBlank { "没有返回内容" }
+                        cfg.appendLog("[失败] $why")
+                        postNotification("这次没答出来：$why")
+                        // 不记指纹：改完密钥/网络恢复后还能重试；但先冷却一会儿，别狂刷
+                        lastAskAt = System.currentTimeMillis() + FAIL_COOLDOWN_MS
+                    }
+                    isNotAQuestion(answer) -> {
+                        cfg.appendLog("[跳过] 模型判断不是题目")
+                        lastFingerprint = fp
+                        lastAskAt = System.currentTimeMillis() + FAIL_COOLDOWN_MS
+                    }
+                    else -> {
+                        cfg.appendLog("[答案] ${answer.take(120).replace('\n', ' ')}")
+                        lastFingerprint = fp
+                        lastAskAt = System.currentTimeMillis()
+                        withContext(Dispatchers.Main) { showAnswer(answer) }
+                    }
                 }
+            } finally {
+                busy = false
             }
         }
+    }
+
+    /** 稳定重试：页面可能还在渲染，隔一会儿再读，最多 3 轮。 */
+    private fun retryLater(allowOcr: Boolean, attempt: Int): Boolean {
+        if (attempt + 1 >= MAX_ATTEMPTS) return false
+        main.postDelayed({
+            readOnce(allowOcr = allowOcr, manual = false, attempt = attempt + 1, force = true)
+        }, 600L * (attempt + 1))
+        return true
     }
 
     private fun showAnswer(answer: String) {
@@ -239,15 +322,15 @@ class ScreenReadService : AccessibilityService() {
         return sb.toString()
     }
 
-    /** 数一数屏上有几个"短文本且可点"的节点——通常就是选项按钮。 */
-    private fun countShortClickable(node: AccessibilityNodeInfo?, depth: Int = 0): Int {
+    /** 统计"1~12 字的短文本节点"数量。不要求 clickable——H5 的选项文字常常挂在不可点的子节点上。 */
+    private fun countShortTexts(node: AccessibilityNodeInfo?, depth: Int = 0): Int {
         if (node == null || depth > 40) return 0
         var n = 0
         val t = node.text?.toString()?.trim().orEmpty()
-        if (node.isClickable && t.length in 1..12 && !node.isEditable) n++
+        if (t.length in 1..12 && !node.isEditable) n++
         for (i in 0 until node.childCount) {
             val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
-            n += countShortClickable(child, depth + 1)
+            n += countShortTexts(child, depth + 1)
         }
         return n
     }
@@ -256,25 +339,21 @@ class ScreenReadService : AccessibilityService() {
         text.replace(Regex("[\\s\\u3000]+"), " ").take(400)
 
     /**
-     * 粗筛"像不像题目"。
-     * 关键教训：很多题库/问答页根本不打问号、不用 A/B/C/D，只给"题干 + 两个按钮"。
-     * 所以判据必须包含"枚举结构"本身，不能只靠标点。
+     * 粗筛"像不像题目"。宁可多问一次也别漏：
+     * 很多题库/问答页不打问号、不用 A/B/C/D，只给"题干 + 几个按钮"。
      */
     private fun looksLikeQuestion(text: String): Boolean {
         if (text.length < MIN_TEXT_LEN) return false
 
-        // 1) 强特征：问号、选项字母、常见题干词
         val strong = listOf(
             "？", "?", "（ ）", "( )", "下列", "以下", "选项", "正确的是", "错误的是",
             "判断", "填空", "多少", "哪项", "哪一", "计算", "求值"
         )
         if (strong.any { text.contains(it) }) return true
 
-        // 2) 结构特征：屏上有 ≥2 个短文本可点节点（典型二选一/多选一）+ 屏上有题干长度
-        val opts = runCatching { countShortClickable(pendingRoot) }.getOrDefault(0)
-        if (opts >= 2 && text.length >= 8) return true
+        val shortTexts = runCatching { countShortTexts(pendingRoot) }.getOrDefault(0)
+        if (shortTexts >= 2 && text.length >= 8) return true
 
-        // 3) 弱特征：题库类页面常见措辞（这题"知识问答 西湖龙井产自"就是靠这条救回来）
         val weak = listOf(
             "知识问答", "问答", "产自", "位于", "属于", "是什么", "是指", "意思",
             "作者", "成立于", "被称为", "出自", "哪个", "哪座", "哪种", "哪年"
@@ -288,7 +367,6 @@ class ScreenReadService : AccessibilityService() {
         return a.length <= 8 && (a.contains("不是题目") || a.contains("无法判断") || a.contains("信息不足"))
     }
 
-    /** 把整个屏幕文字交给模型，同时要求它先判断"这里到底有没有题"。 */
     private fun buildQuestion(screen: String): String {
         val cleaned = screen.lineSequence()
             .map { it.trim() }
@@ -309,8 +387,8 @@ class ScreenReadService : AccessibilityService() {
     // ======================= 自动操控 =======================
 
     /**
-     * 按答案去点选项。两种匹配：先按答案里的文字（"杭州"）找，再按选项字母找。
-     * 只在「自动操控」开着且用户点了悬浮窗上的按钮时才调用；找不到就跳过，不瞎点。
+     * 按答案去点选项。先按答案文字（"杭州"）匹配，再退到选项字母。
+     * 只在「自动操控」开着且用户点了悬浮窗按钮时才调用；找不到就跳过，不瞎点。
      */
     private fun autoClickAnswer(answer: String) {
         val root = pendingRoot
@@ -319,7 +397,6 @@ class ScreenReadService : AccessibilityService() {
             return
         }
 
-        // 先按答案文字匹配（最可靠：选项本身是"杭州"/"苏州"这种词）
         val candidates = answer
             .replace(Regex("[（(].*?[）)]"), " ")
             .split('\n', '，', ',', '。', '；', ';', '：', ':', '、', ' ')
@@ -335,7 +412,6 @@ class ScreenReadService : AccessibilityService() {
             return
         }
 
-        // 退一步：按选项字母
         val letter = Regex("(?<![A-Za-z])([ABCD])\\s*[.、．)）:：]").find(answer)?.groupValues?.get(1)
             ?: Regex("(?:答案选?|选)\\s*([ABCD])\\b").find(answer)?.groupValues?.get(1)
         if (letter != null) {
@@ -354,6 +430,8 @@ class ScreenReadService : AccessibilityService() {
         val hit = t.isNotEmpty() && t.length <= 20 &&
                 (t == target || t == "$target." || t.equals(target, ignoreCase = true))
         if (node.isClickable && hit) return node
+        // 选项文字常常挂在不可点的子节点上，父节点才是按钮 → 沿父链往上找
+        if (hit && node.parent?.isClickable == true) return node.parent
         for (i in 0 until node.childCount) {
             val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
             val found = findClickableByText(child, target, depth + 1)
@@ -380,7 +458,7 @@ class ScreenReadService : AccessibilityService() {
     }
 
     @android.annotation.SuppressLint("MissingPermission")
-    private fun postNotification(text: String = "屏知正在后台识屏，点击打开") {
+    private fun postNotification(text: String = "屏知正在后台待命，切到题目页会自动读") {
         val intent = Intent(this, ControlActivity::class.java)
         val pi = android.app.PendingIntent.getActivity(
             this, 0, intent,
@@ -409,6 +487,7 @@ class ScreenReadService : AccessibilityService() {
     override fun onInterrupt() = stopAll()
 
     override fun onDestroy() {
+        stopHeartbeat()
         runCatching { unregisterReceiver(cmdReceiver) }
         stopAll()
         runCatching {

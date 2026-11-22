@@ -230,8 +230,9 @@ class ControlActivity : AppCompatActivity() {
             android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 16 })
 
         val tryTip = TextView(this).apply {
-            text = "点了之后 4 秒内切到题目页。它会立刻读一次屏并把每一步写进下面的日志——" +
-                   "「读题」= 读到了；「跳过」= 判定不是题目；「失败」= 密钥/网络问题。"
+            text = "平时不用点它：切到题目页会自动读（页面变化会触发，静止时每 3 秒也会巡检一次）。" +
+                   "这个按钮只用来排障——点了之后 4 秒内切到题目页，它会把每一步写进下面的日志：" +
+                   "「读题」= 读到了；「跳过」= 判定不是题目；「失败」= 密钥或网络问题。"
             setTextColor(android.graphics.Color.parseColor("#6F8B84"))
             textSize = 11.5f
             setLineSpacing(3f, 1.25f)
