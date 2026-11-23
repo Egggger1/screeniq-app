@@ -96,6 +96,7 @@ object ControlBubble {
                 @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -106,6 +107,13 @@ object ControlBubble {
         lp = p
 
         val root = FrameLayout(app)
+        // 点窗口外面就收起菜单，不用再点一次胶囊（审查 L-5）
+        root.setOnTouchListener { _, e ->
+            if (e.action == MotionEvent.ACTION_OUTSIDE && menu?.visibility == View.VISIBLE) {
+                collapse()
+                true
+            } else false
+        }
 
         // 竖列：胶囊在上，菜单在它下方展开（关键：两者永不同位）
         // 注意 minimumWidth 只给菜单，不给竖列——上一版把 212dp 给了整列，

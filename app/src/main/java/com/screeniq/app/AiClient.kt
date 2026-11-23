@@ -1,14 +1,21 @@
 package com.screeniq.app
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * @param px,py 看图时模型给出的"该点哪里"（相对坐标 0~1，左上为原点）。
@@ -56,7 +63,7 @@ object Providers {
 private const val PROMPT_DETAIL =
     "你是手机端答疑助手，答案要让人一眼看完。规则：\n" +
     "1. 第一行只写最终答案，格式「答案：xxx」。选择题写选项文字，例如「答案：B. 万里长征人未还」。\n" +
-    "2. 之后最多 3 行要点解析，每行不超过 30 字；不必解释就只给答案。\n" +
+    "2. 之后最多 3 行要点解析，每行不超过 30 字；解析里不要完整写出其它错误选项的文字（防止误点）。\n" +
     "3. 不要寒暄、不要复述题目、不要 Markdown 标题、不要加粗星号。\n" +
     "4. 信息不足只写「信息不足」。"
 
@@ -81,7 +88,7 @@ private const val PROMPT_VISION =
     "如果答案就是屏幕上某一个可点选项，请在最后单独一行写 CHOICE:编号（只写数字）。" +
     "编号绝对不要写进答案正文。\n" +
     "8. 如果看不到编号但能确定位置，也可以写一行 POINT:x,y，x、y 是 0~1 的小数（左上角是 0,0）。" +
-    "能看到编号就只写 CHOICE，不要写 POINT。\n" +
+    "能看到编号就只写 CHOICE，不要写 POINT。编号/坐标只能是题目选项的，绝不能是支付、授权、发送、删除类按钮。\n" +
     "9. 如果题目下面还给了「可点控件清单」（每项像 E3 这样开头），答案又是其中某一项，" +
     "请在最后单独一行写 CLICK:E编号（例如 CLICK:E3）。清单编号和图上的圆牌编号是两套，" +
     "来自清单就写 CLICK:E…，来自图上圆牌就写 CHOICE:…，两者只写一个。"
@@ -118,7 +125,7 @@ class AiClient(private val cfg: ConfigStore) {
         pointRe.find(text)?.let { m ->
             val x = m.groupValues[1].toFloatOrNull()
             val y = m.groupValues[2].toFloatOrNull()
-            if (x != null && y != null && x >= 0f && y >= 0f) {
+            if (x != null && y != null && x in 0f..1f && y in 0f..1f) {
                 px = x
                 py = y
                 text = text.replace(m.value, "")
@@ -231,13 +238,38 @@ class AiClient(private val cfg: ConfigStore) {
                 .post(body.toRequestBody("application/json".toMediaType()))
                 .build()
 
-            http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    val hint = if (imageBase64 != null && (resp.code == 400 || resp.code == 404))
-                        "（$model 可能不支持图片，换个模型或关掉看图）" else ""
-                    return@withContext AiResult("", name, false, "接口返回 ${resp.code}$hint")
+            // 用 enqueue 而不是 execute：协程超时/停服时能真正 cancel 掉 socket，
+            // 不会留下一个旧请求在后台跑完、又计费一次（审查 M-20）。
+            val call = http.newCall(req)
+            val resp = suspendCancellableCoroutine<Response> { cont ->
+                call.enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        if (cont.isActive) cont.resumeWithException(e)
+                    }
+                    override fun onResponse(call: Call, response: Response) {
+                        if (cont.isActive) cont.resume(response) else response.close()
+                    }
+                })
+                cont.invokeOnCancellation { runCatching { call.cancel() } }
+            }
+
+            resp.use { r ->
+                if (!r.isSuccessful) {
+                    val hint = when (r.code) {
+                        401, 403 -> "（密钥无效或额度不足，去面板换 key）"
+                        429 -> "（调用太频繁或额度用尽，稍后再试）"
+                        400, 404 -> if (imageBase64 != null)
+                            "（$model 可能不支持图片，换个模型或关掉看图）" else "（模型名或请求格式不对）"
+                        in 500..599 -> "（服务商暂时故障）"
+                        else -> ""
+                    }
+                    return@withContext AiResult("", name, false, "接口返回 ${r.code}$hint")
                 }
-                val data = JSONObject(resp.body!!.string())
+                val raw = r.body?.string()
+                if (raw.isNullOrBlank()) {
+                    return@withContext AiResult("", name, false, "接口返回空内容")
+                }
+                val data = JSONObject(raw)
                 val text = data.getJSONArray("choices")
                     .getJSONObject(0).getJSONObject("message").getString("content")
                 val tagged = parseTags(text)
@@ -247,7 +279,11 @@ class AiClient(private val cfg: ConfigStore) {
                 )
             }
         } catch (e: Exception) {
-            AiResult("", name, false, "调用失败：${e.javaClass.simpleName}")
+            // 保留可读原因，但绝不能把 Authorization 头回显到界面/日志
+            val detail = (e.message ?: "").take(90)
+                .replace(Regex("Bearer\\s+\\S+"), "Bearer ***")
+                .replace('\n', ' ')
+            AiResult("", name, false, "调用失败：${e.javaClass.simpleName} $detail")
         }
     }
 

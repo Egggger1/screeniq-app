@@ -34,7 +34,19 @@ class FlowBorderView(context: Context) : View(context) {
     private val colorGlow = Color.parseColor("#A3E8D8")
     private val colorIdle = Color.parseColor("#2A4742")
 
+    // 每帧 new 对象会让这个常驻动画持续 GC（审查 M-12）；三样都提到字段复用
+    private val rect = RectF()
+    private val matrix = Matrix()
+    private var shader: SweepGradient? = null
+    private var shaderW = 0
+    private var shaderH = 0
+
     private fun dp(v: Float) = v * resources.displayMetrics.density
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        shader = null   // 中心点变了，渐变要跟着重建
+    }
 
     /** 开/关动画。重复调用无副作用。 */
     fun setActive(on: Boolean) {
@@ -73,7 +85,7 @@ class FlowBorderView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val inset = paint.strokeWidth / 2f + dp(1f)
-        val rect = RectF(inset, inset, width.toFloat() - inset, height.toFloat() - inset)
+        rect.set(inset, inset, width.toFloat() - inset, height.toFloat() - inset)
         val radius = dp(18f)
 
         if (!active) {
@@ -85,13 +97,17 @@ class FlowBorderView(context: Context) : View(context) {
 
         val cx = width / 2f
         val cy = height / 2f
-        val shader = SweepGradient(
-            cx, cy,
-            intArrayOf(Color.TRANSPARENT, colorMain, colorGlow, colorMain, Color.TRANSPARENT),
-            floatArrayOf(0f, 0.08f, 0.16f, 0.24f, 0.34f)
-        )
-        val matrix = Matrix().apply { setRotate(angle, cx, cy) }
-        shader.setLocalMatrix(matrix)
+        if (shader == null || shaderW != width || shaderH != height) {
+            shader = SweepGradient(
+                cx, cy,
+                intArrayOf(Color.TRANSPARENT, colorMain, colorGlow, colorMain, Color.TRANSPARENT),
+                floatArrayOf(0f, 0.08f, 0.16f, 0.24f, 0.34f)
+            )
+            shaderW = width
+            shaderH = height
+        }
+        matrix.setRotate(angle, cx, cy)
+        shader!!.setLocalMatrix(matrix)
         paint.shader = shader
         canvas.drawRoundRect(rect, radius, radius, paint)
     }

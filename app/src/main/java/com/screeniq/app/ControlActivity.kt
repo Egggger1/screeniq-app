@@ -20,6 +20,7 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 
 /**
  * 后台识屏控制面板（App 主界面）。
@@ -46,6 +47,7 @@ class ControlActivity : AppCompatActivity() {
     private lateinit var swBorder: Switch
     private lateinit var swBubble: Switch
     private var initializing = true   // 抑制初始化时开关回调
+    private var leavingForPermission = false   // 跳系统设置期间别把悬浮球盖在设置页上
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -86,6 +88,7 @@ class ControlActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         AppVisible.foreground = true
+        leavingForPermission = false
         ControlBubble.hide()      // 面板在前台时不需要悬浮球，避免两套入口打架
         refreshServiceState()
         applySwitches()           // 悬浮球上按过开始/暂停后，面板里的开关要跟着变
@@ -93,19 +96,19 @@ class ControlActivity : AppCompatActivity() {
 
     override fun onPause() {
         AppVisible.foreground = false
-        // 退出面板 = 自动变成悬浮球，之后开始/暂停都不用再回 App
-        if (cfg.bubble() && ScreenReadService.instance != null) ControlBubble.show(this)
+        // 退出面板 = 自动变成悬浮球；但去系统设置授权时不要盖在设置页上（审查 L-15）
+        if (!leavingForPermission && cfg.bubble() && ScreenReadService.instance != null) ControlBubble.show(this)
         else ControlBubble.hide()
         super.onPause()
     }
 
     @SuppressLint("SetTextI18n")
     private fun buildUi() {
-        val pad = 44
+        val pad = dp(16)
         val root = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setBackgroundColor(android.graphics.Color.parseColor("#091312"))
-            setPadding(pad, 90, pad, pad)
+            setPadding(pad, dp(28), pad, pad)
         }
 
         val title = TextView(this).apply {
@@ -185,18 +188,29 @@ class ControlActivity : AppCompatActivity() {
 
         swRead.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
-            cfg.setAutoRead(v)
+            // 没权限就不能把"开"持久化，否则面板显示开着、服务却没连上（审查 M-8）
             if (v && !isServiceEnabled()) {
                 Toast.makeText(this, "请先点上面的「开启读屏权限」", Toast.LENGTH_LONG).show()
+                initializing = true
+                swRead.isChecked = false
+                initializing = false
+                cfg.setAutoRead(false)
+                openAccessibilitySettings()
+                refreshGuide()
+                return@setOnCheckedChangeListener
             }
+            cfg.setAutoRead(v)
             refreshGuide()
             syncBorders()
         }
         swOverlay.setOnCheckedChangeListener { _, v ->
             if (initializing) return@setOnCheckedChangeListener
             if (v && !Settings.canDrawOverlays(this)) {
+                // 回滚必须包 initializing，否则重入监听器会把原配置写成 false（审查 M-22）
+                initializing = true
+                swOverlay.isChecked = cfg.overlay()
+                initializing = false
                 requestOverlayPermission()
-                swOverlay.isChecked = false
                 return@setOnCheckedChangeListener
             }
             cfg.setOverlay(v)
@@ -244,7 +258,7 @@ class ControlActivity : AppCompatActivity() {
             android.widget.LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 16 })
 
         val tryTip = TextView(this).apply {
-            text = "平时不用点它：切到题目页会自动读（页面变化会触发，静止时每 1.5 秒也会巡检一次）。" +
+            text = "平时不用点它：切到题目页会自动读（页面变化会触发，静止时约每 1.2 秒也会巡检一次）。" +
                    "这个按钮只用来排障——点了之后 4 秒内切到题目页，它会把每一步写进下面的日志：" +
                    "「读题」= 读到了；「跳过」= 判定不是题目；「操控」= 点选过程；「失败」= 密钥或网络问题。"
             setTextColor(android.graphics.Color.parseColor("#6F8B84"))
@@ -404,9 +418,18 @@ class ControlActivity : AppCompatActivity() {
     private fun saveAiConfig() {
         val pid = Providers.list.getOrNull(spProvider.selectedItemPosition)?.get("id") as? String ?: "deepseek"
         val key = etKey.text.toString().trim()
+        val switched = cfg.provider() != pid
         cfg.save(pid, key, "", "")
         etKey.setText("")
-        Toast.makeText(this, if (key.isBlank()) "模型已切换（密钥未改动）" else "已保存，切到题库 App 即可真答题", Toast.LENGTH_SHORT).show()
+        // 换服务商时旧 key 已被清掉，绝不能给"密钥未改动"这种误导提示（审查 S-2）
+        val name = Providers.find(pid)?.get("name") ?: pid
+        val msg = when {
+            switched && key.isBlank() -> "已切换到 $name，旧密钥已清除，请重新填写该服务商的密钥"
+            switched -> "已切换到 $name 并保存密钥"
+            key.isBlank() -> "密钥未改动"
+            else -> "已保存，切到题库 App 即可真答题"
+        }
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
         refreshAiStatus()
     }
 
@@ -416,11 +439,12 @@ class ControlActivity : AppCompatActivity() {
         val p = Providers.find(cfg.provider())
         val name = p?.get("name") ?: cfg.provider()
         if (key.isBlank()) {
-            tvAiStatus.text = "当前：$name · 未填密钥（先用假答题演示）"
+            tvAiStatus.text = "当前：$name · 未填密钥，不会作答"
             tvAiStatus.setTextColor(android.graphics.Color.parseColor("#FFD98F"))
         } else {
             val masked = if (key.length >= 8) "${key.take(4)}••••${key.takeLast(4)}" else "••••"
-            tvAiStatus.text = "当前：$name · 已配置 $masked"
+            val enc = if (cfg.keyIsEncrypted()) "已加密" else "明文降级（本机不支持 Keystore）"
+            tvAiStatus.text = "当前：$name · 已配置 $masked（$enc）"
             tvAiStatus.setTextColor(android.graphics.Color.parseColor("#5DCAA5"))
         }
     }
@@ -554,12 +578,14 @@ class ControlActivity : AppCompatActivity() {
     }
 
     private fun openAccessibilitySettings() {
+        leavingForPermission = true
         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         Toast.makeText(this, "在系统设置里找到「屏知 ScreenIQ」并打开", Toast.LENGTH_LONG).show()
     }
 
     private fun requestOverlayPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            leavingForPermission = true
             val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
             startActivityForResult(intent, REQ_OVERLAY)
         }
@@ -575,8 +601,16 @@ class ControlActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        runCatching { registerReceiver(stateReceiver, IntentFilter(ScreenReadService.ACTION_STATE)) }
-        runCatching { registerReceiver(logReceiver, IntentFilter(ConfigStore.ACTION_LOG)) }
+        // targetSdk 35 / Android 14+ 必须显式声明导出标志，否则注册直接抛 SecurityException。
+        // 以前被 runCatching 吞掉，面板看不到状态和日志刷新（审查 M-7）。
+        ContextCompat.registerReceiver(
+            this, stateReceiver, IntentFilter(ScreenReadService.ACTION_STATE),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        ContextCompat.registerReceiver(
+            this, logReceiver, IntentFilter(ConfigStore.ACTION_LOG),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
     }
 
     override fun onStop() {

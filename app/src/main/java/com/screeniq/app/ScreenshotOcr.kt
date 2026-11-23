@@ -13,6 +13,7 @@ import androidx.annotation.RequiresApi
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 
@@ -45,10 +46,21 @@ object ScreenshotOcr {
     /** Android 11 以下没有无障碍截图接口，只能走节点。 */
     val supported: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
 
+    /** 最近一次截图失败码：0=成功，非 0 见 AccessibilityService.ERROR_TAKE_SCREENSHOT_*。 */
+    @Volatile var lastError: Int = 0
+        private set
+
+    /** 系统对 takeScreenshot 有调用间隔限制，保守留 1 秒；不够就等，而不是让 OCR 静默缺失。 */
+    private const val MIN_SHOT_INTERVAL_MS = 1000L
+    private var lastShotAt = 0L
+
     /** 抓一张已经缩好的屏幕图，调用方决定怎么用（识别 / 发给视觉模型 / 算指纹）。 */
     @RequiresApi(Build.VERSION_CODES.R)
     suspend fun grabScaled(service: AccessibilityService, maxWidth: Int = 1080): Bitmap? {
+        val wait = MIN_SHOT_INTERVAL_MS - (System.currentTimeMillis() - lastShotAt)
+        if (wait > 0) delay(wait)
         val shot = grab(service) ?: return null
+        lastShotAt = System.currentTimeMillis()
         val scaled = downscale(shot, maxWidth)
         if (scaled !== shot) runCatching { shot.recycle() }
         return scaled
@@ -57,8 +69,12 @@ object ScreenshotOcr {
     /** 离线识别：返回每行文字及其边框，供"按坐标点选"和"编号定位"使用。 */
     suspend fun recognizeLines(bmp: Bitmap): List<OcrLine> =
         suspendCancellableCoroutine { cont ->
+            // ML Kit 的 Task 本身不能取消；至少在协程已取消时丢弃结果，别再往下游送（审查 M-13）
+            var cancelled = false
+            cont.invokeOnCancellation { cancelled = true }
             recognizer.process(InputImage.fromBitmap(bmp, 0))
                 .addOnSuccessListener { result ->
+                    if (cancelled || !cont.isActive) return@addOnSuccessListener
                     val out = ArrayList<OcrLine>(32)
                     for (block in result.textBlocks) {
                         for (line in block.lines) {
@@ -68,13 +84,15 @@ object ScreenshotOcr {
                             out.add(OcrLine(t, box.exactCenterX(), box.exactCenterY(), Rect(box)))
                         }
                     }
-                    if (cont.isActive) cont.resume(out)
+                    cont.resume(out)
                 }
-                .addOnFailureListener { if (cont.isActive) cont.resume(emptyList()) }
+                .addOnFailureListener {
+                    if (!cancelled && cont.isActive) cont.resume(emptyList())
+                }
         }
 
     /**
-     * 「这一屏长什么样」的感知指纹：24×24 的亮度哈希（aHash）。
+     * 「这一屏长什么样」的感知指纹：32×32 的亮度哈希（aHash）。
      *
      * 为什么不用 OCR 文字算：题目可能是纯图片，换题后文字一个字都不变，
      * 上一版就是因此认为"内容没变"而永远不再读。像素哈希能直接看出画面换了。
@@ -92,8 +110,9 @@ object ScreenshotOcr {
         val bottom = (h - (h * 0.04f).toInt()).coerceAtMost(h - 1)
         if (right <= left || bottom <= top) return ""
 
-        val cols = 24
-        val rows = 24
+        // 32×32：24×24 对布局接近的两屏有碰撞可能，纯图片题只能靠它判换题（审查 L-11）
+        val cols = 32
+        val rows = 32
         val lum = IntArray(cols * rows) { -1 }
         var sum = 0L
         var valid = 0
@@ -177,6 +196,9 @@ object ScreenshotOcr {
     @RequiresApi(Build.VERSION_CODES.R)
     private suspend fun grab(service: AccessibilityService): Bitmap? =
         suspendCancellableCoroutine { cont ->
+            lastError = 0
+            var cancelled = false
+            cont.invokeOnCancellation { cancelled = true }
             runCatching {
                 service.takeScreenshot(
                     Display.DEFAULT_DISPLAY,
@@ -188,16 +210,19 @@ object ScreenshotOcr {
                                     ?.copy(Bitmap.Config.ARGB_8888, false)
                             }.getOrNull()
                             runCatching { result.hardwareBuffer.close() }
-                            if (cont.isActive) cont.resume(bmp)
+                            // 协程取消后回调才到达的 bitmap 必须回收，否则每次切屏漏 ~10MB（审查 M-21）
+                            if (cont.isActive && !cancelled) cont.resume(bmp)
+                            else bmp?.let { runCatching { it.recycle() } }
                         }
 
                         override fun onFailure(errorCode: Int) {
-                            if (cont.isActive) cont.resume(null)
+                            lastError = errorCode
+                            if (cont.isActive && !cancelled) cont.resume(null)
                         }
                     }
                 )
             }.onFailure {
-                if (cont.isActive) cont.resume(null)
+                if (cont.isActive && !cancelled) cont.resume(null)
             }
         }
 

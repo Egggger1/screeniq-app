@@ -5,6 +5,10 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# 最小权限：构建只需要读代码（审查 L-8）
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,7 +22,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: 安装 Gradle 8.7（wrapper 脚本已在仓库，用它保证版本一致）
+      - name: 安装 Gradle 8.7（仓库只有 wrapper 配置，由 setup-gradle 提供可执行文件）
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'

@@ -24,7 +24,7 @@ import kotlin.math.abs
  *
  * 这一版最重要的改动是「不挡手」：
  * 1. 贴在屏幕顶部（状态栏下方），高度最多占屏高 30%，不再压在题目和选项上；
- * 2. 15 秒后自动收成右上角一个小胶囊，几乎不可能误触；
+ * 2. 30 秒后自动收成右上角一个小胶囊，几乎不可能误触；
  * 3. 窗口带 FLAG_NOT_TOUCH_MODAL —— 卡片以外的触摸直接交给下层 App；
  * 4. 「自动点选」按钮只在自动操控开启时才出现，默认根本没有这个按钮。
  */
@@ -193,7 +193,8 @@ object AnswerOverlay {
 
             val added = runCatching { w.addView(root, p) }.isSuccess
             if (!added) {
-                host = null; card = null; pill = null; answerView = null; wm = null
+                host = null; card = null; pill = null; answerView = null
+                headerView = null; wm = null; lp = null
                 return@post
             }
 
@@ -295,6 +296,8 @@ object AnswerOverlay {
         pill = null
         answerView = null
         headerView = null
+        wm = null
+        lp = null
     }
 
     /** 拖动手柄：按住移动窗口；轻点则执行 onClick（胶囊=展开，标题栏=收起）。 */

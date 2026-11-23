@@ -3,6 +3,8 @@ package com.screeniq.app
 import android.content.Context
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.WindowManager
 
@@ -18,7 +20,15 @@ object RunningBorderOverlay {
 
     private var view: FlowBorderView? = null
 
-    fun show(context: Context) {
+    /** WindowManager 的 add/remove 必须在主线程；调用方以后从协程进来也不会崩（审查 L-16）。 */
+    private fun onMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block()
+        else Handler(Looper.getMainLooper()).post(block)
+    }
+
+    fun show(context: Context) = onMain { showOnMain(context) }
+
+    private fun showOnMain(context: Context) {
         if (view != null) return
         val app = context.applicationContext
         if (!android.provider.Settings.canDrawOverlays(app)) return
@@ -44,8 +54,8 @@ object RunningBorderOverlay {
         runCatching { wm.addView(v, lp) }.onSuccess { view = v }
     }
 
-    fun hide() {
-        val v = view ?: return
+    fun hide() = onMain {
+        val v = view ?: return@onMain
         val wm = v.context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         runCatching { wm.removeView(v) }
         view = null
