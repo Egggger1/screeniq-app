@@ -1761,8 +1761,8 @@ class ScreenReadService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
+        // AccessibilityService.onInterrupt() 是 abstract 成员，不能 super 调用
         shutdown()
-        super.onInterrupt()
     }
 
     override fun onDestroy() {
