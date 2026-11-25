@@ -11,8 +11,8 @@ android {
         applicationId = "com.screeniq.app"
         minSdk = 23          // 覆盖 Android 6.0+，荣耀绝大多数机型
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.5.1-安全加固与误点防护"
+        versionCode = 14
+        versionName = "0.6.0-字母锚点与多选防漏选"
 
         // 只打真机在用的两种 ABI。ML Kit 的识别引擎每个 ABI 要 ~11MB，
         // 四个 ABI 全带就是 45MB 白装；x86/x86_64 是模拟器用的，手机根本用不到。

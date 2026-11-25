@@ -34,7 +34,12 @@ data class AiResult(
     val px: Float = -1f,
     val py: Float = -1f,
     val choice: Int = 0,
-    val nodeNo: Int = 0
+    val nodeNo: Int = 0,
+    // 选项字母锚点：单选 "C"，多选 "ABD"。这是比文字匹配可靠得多的定位线索——
+    // 屏幕上选项前的 A/B/C/D 字母是固定的，模型改写措辞也不会变（审查 S-1 强化）。
+    val letters: String = "",
+    // 是否多选题：模型明确说了才算。true 时自动作答链路会逐个点亮每个选项。
+    val multi: Boolean = false
 )
 
 /** 内置模型清单：都走 OpenAI 兼容接口。 */
@@ -62,16 +67,19 @@ object Providers {
 
 private const val PROMPT_DETAIL =
     "你是手机端答疑助手，答案要让人一眼看完。规则：\n" +
-    "1. 第一行只写最终答案，格式「答案：xxx」。选择题写选项文字，例如「答案：B. 万里长征人未还」。\n" +
-    "2. 之后最多 3 行要点解析，每行不超过 30 字；解析里不要完整写出其它错误选项的文字（防止误点）。\n" +
-    "3. 不要寒暄、不要复述题目、不要 Markdown 标题、不要加粗星号。\n" +
-    "4. 信息不足只写「信息不足」。"
+    "1. 第一行只写最终答案，格式「答案：X. 选项文字」。X 是选项字母，单选题只写一个，例如「答案：B. 万里长征人未还」。\n" +
+    "2. 多选题（题干有「哪些/正确的有/多选」等）第一行写「答案：A,B,D」，字母用英文逗号分隔，按字母顺序。\n" +
+    "3. 第二行必须写一个定位标记，单行选择写 ANS:A（换成你的答案字母）；多选写 ANS:A,B,D。这一行只给程序定位用，不要写进答案正文。\n" +
+    "4. 之后最多 3 行要点解析，每行不超过 30 字；解析里不要完整写出其它错误选项的文字（防止误点）。\n" +
+    "5. 不要寒暄、不要复述题目、不要 Markdown 标题、不要加粗星号。\n" +
+    "6. 信息不足只写「信息不足」。"
 
 private const val PROMPT_BRIEF =
     "你是手机端答疑助手，用户只想快速核对答案。规则：\n" +
-    "1. 只输出一行：答案本身。选择题写成「A. 内容」。\n" +
-    "2. 不要解释、不要步骤、不要寒暄。\n" +
-    "3. 信息不足只写「信息不足」。"
+    "1. 输出两行。第一行：答案本身，单选题「A. 内容」，多选题「A,B,D」。\n" +
+    "2. 第二行：定位标记，单选 ANS:A（换成你的答案字母），多选 ANS:A,B,D。只写字母，给程序定位用。\n" +
+    "3. 不要解释、不要步骤、不要寒暄。\n" +
+    "4. 信息不足只写「信息不足」。"
 
 /**
  * 看图时追加的规则：
@@ -112,7 +120,21 @@ class AiClient(private val cfg: ConfigStore) {
     private val clickRe = Regex("CLICK\\s*[:：]\\s*E?\\s*(\\d{1,3})", RegexOption.IGNORE_CASE)
 
     /**
-     * 把坐标/编号行从答案正文里摘出来：正文给用户看，坐标与编号给自动点选用。
+     * ANS:A / ANS:A,B,D —— 模型给出的选项字母锚点。
+     * 字母可以写成 A,B,D / ABD / A、B、D / （A），这里统一归一成去重后的 "ABD"。
+     * 只认 A-D，超出范围的（例如 E、F）丢掉，避免把正文里的英文误当答案。
+     */
+    private val ansRe = Regex(
+        "ANS\\s*[:：]\\s*([A-Da-d](?:\\s*[,，、]\\s*[A-Da-d])*|[A-Da-d]{1,4})",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** 从 ANS 捕获串里抽出字母，归一、去重、排序成 "ABD"。 */
+    private fun normalizeLetters(s: String): String =
+        s.uppercase().replace(Regex("[^A-D]"), "").toSet().sorted().joinToString("")
+
+    /**
+     * 把坐标/编号/字母行从答案正文里摘出来：正文给用户看，坐标与编号给自动点选用。
      * 编号是 0 基还是 1 基？截图上的圆牌是从 1 开始写的，所以这里原样返回，由调用方减 1。
      */
     private fun parseTags(raw: String): AiResult {
@@ -121,6 +143,8 @@ class AiClient(private val cfg: ConfigStore) {
         var py = -1f
         var choice = 0
         var nodeNo = 0
+        var letters = ""
+        var multi = false
 
         pointRe.find(text)?.let { m ->
             val x = m.groupValues[1].toFloatOrNull()
@@ -145,7 +169,21 @@ class AiClient(private val cfg: ConfigStore) {
                 text = text.replace(m.value, "")
             }
         }
-        return AiResult(text.trim(), "", true, "", px, py, choice, nodeNo)
+        ansRe.find(text)?.let { m ->
+            val got = normalizeLetters(m.groupValues[1])
+            if (got.isNotEmpty()) {
+                letters = got
+                multi = got.length > 1
+                text = text.replace(m.value, "")
+            }
+        }
+        // 多行 CHOICE / CLICK：多选时模型可能每个选项各写一行编号。
+        val extraChoices = choiceRe.findAll(text).mapNotNull { it.groupValues[1].toIntOrNull() }
+            .filter { it in 1..99 }.toList()
+        if (extraChoices.size > 1) {
+            choice = extraChoices.first()
+        }
+        return AiResult(text.trim(), "", true, "", px, py, choice, nodeNo, letters, multi)
     }
 
     private val http = OkHttpClient.Builder()
@@ -275,7 +313,8 @@ class AiClient(private val cfg: ConfigStore) {
                 val tagged = parseTags(text)
                 AiResult(
                     tagged.answer, "$name · $model", true, "",
-                    tagged.px, tagged.py, tagged.choice, tagged.nodeNo
+                    tagged.px, tagged.py, tagged.choice, tagged.nodeNo,
+                    tagged.letters, tagged.multi
                 )
             }
         } catch (e: Exception) {
