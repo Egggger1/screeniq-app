@@ -74,13 +74,13 @@ object YoyoLab {
         cfg.appendLog("[YOYO实验] 开始")
 
         // 记下唤起前的屏幕文字，读回时用来排除题面本身
-        val beforeText = if (ScreenshotOcr.supported) {
+        val beforeText: String = if (ScreenshotOcr.supported) {
             ScreenshotOcr.grabScaled(service)?.let { bmp ->
                 val s = ScreenshotOcr.recognizeLines(bmp).joinToString(" ") { it.text }
                 bmp.recycle()
                 s
-            }
-        } else "" ?: ""
+            } ?: ""
+        } else ""
 
         // ---------- ① 唤醒：ACTION_ASSIST（等价于电源键唤醒 YOYO）----------
         val wakeOk = fireAssist(service)
