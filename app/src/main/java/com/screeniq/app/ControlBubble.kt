@@ -215,6 +215,19 @@ object ControlBubble {
         itemToggle = toggleItem
         menuView.addView(toggleItem, itemLp(d))
 
+        // 实验版专用入口：点一下跑一次 YOYO 唤出诊断（不进正式版时删掉这一项即可）
+        menuView.addView(menuItem(app, "🧪 YOYO 实验", primary = false, d) {
+            if (guard()) return@menuItem
+            val svc = ScreenReadService.instance
+            if (svc == null) {
+                toast(app, "读屏服务没连上：先回面板开一次读屏权限")
+            } else {
+                toast(app, "YOYO 实验开始：请看答案卡上的逐步结果")
+                svc.yoyoLabOnce()
+            }
+            collapse()
+        }, itemLp(d))
+
         menuView.addView(menuItem(app, "⚙ 打开面板", primary = false, d) {
             if (guard()) return@menuItem
             runCatching {

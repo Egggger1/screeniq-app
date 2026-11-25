@@ -273,6 +273,34 @@ class ScreenReadService : AccessibilityService() {
         readOnce(allowOcr = true, manual = true)
     }
 
+    /**
+     * YOYO 实验入口（v0.7.0-lab 专用）：走独立的诊断流程，不碰答题主链路。
+     * 悬浮球点一下 → 尝试唤出系统 AI → 写问题 → 读回答 → 结果显示在答案卡上。
+     */
+    fun yoyoLabOnce() {
+        if (busy) {
+            cfg.appendLog("[YOYO实验] 主读屏正在忙，稍后再点")
+            return
+        }
+        busy = true
+        scope.launch {
+            try {
+                YoyoLab.run(this@ScreenReadService, cfg) { trace ->
+                    withContext(Dispatchers.Main) {
+                        AnswerOverlay.show(
+                            this@ScreenReadService,
+                            trace.summary(),
+                            allowAutoClick = false,
+                            onAutoClick = { "" }
+                        )
+                    }
+                }
+            } finally {
+                busy = false
+            }
+        }
+    }
+
     fun isAutoActionNow(): Boolean = runCatching { cfg.autoAction() }.getOrDefault(false)
 
     /** 悬浮球上的「自动作答」开关：答案一到就自己点，不用再点浮窗按钮。 */
