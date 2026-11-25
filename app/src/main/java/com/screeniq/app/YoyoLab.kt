@@ -15,49 +15,53 @@ import kotlin.coroutines.resume
 /**
  * YOYO 唤出实验（v0.7.0-lab 专用，不进正式版主流程）。
  *
- * 目的：验证"用系统自带 AI 代替云 API"这条路在真机上到底通不通。
- * 一次实验把三关的成败全部记录下来：
- *   ① 唤出：长按小白条手势 / ACTION_ASSIST 意图，两条都试；
- *   ② 输入：找输入框写问题 + 找发送按钮点下去；
- *   ③ 读回：连续截图 OCR，等文字稳定后取 YOYO 的回答。
+ * 依据真机调研（荣耀官方俱乐部 + MagicOS 使用教程）纠正的关键认知：
+ *  1. 唤醒 YOYO 靠「语音 / 长按电源键 / ACTION_ASSIST 意图」，不是底部小白条；
+ *  2. 普通唤醒的 YOYO **默认看不到当前屏幕**，必须走「YOYO 问屏」入口；
+ *  3. 进入问屏有三条路：唤醒后对话框输入「问屏」、双指按压、截屏后「问YOYO」。
+ *
+ * 本实验按无障碍能做到的部分，依次尝试并记录：
+ *   ① 用 ACTION_ASSIST 意图唤醒（等价于电源键唤醒）；
+ *   ② 在对话框写「问屏」并发送，进入识屏模式；
+ *   ③ 再写题目问题并发送；
+ *   ④ 连续截图 OCR 读回回答。
+ * 双指按压属于系统级手势，无障碍不一定注入得了，作为诊断项说明，不强行依赖。
  *
  * 这一版**只诊断、不自动点选、不调云 API**。看到结果再决定要不要往下走。
  *
- * 安全边界：
- *  - 只用无障碍的公开手势/节点写入接口，不碰系统私有 API、不 root；
- *  - 只写我们自己的问题文本，绝不读取/上报用户其他内容；
- *  - 唤出手势只在屏幕底部中央一小段，超时即停，不会卡在系统导航里。
+ * 安全边界：只用无障碍的公开意图/手势/节点写入接口，不碰私有 API、不 root；
+ * 只写我们自己的问题文本，绝不读取或上报用户的其它屏幕内容。
  */
 object YoyoLab {
 
-    /** 实验的逐步记录，既显示在卡片上，也写进日志。 */
     data class Trace(
         val title: String,
-        val wakeGesture: String = "",
-        val wakeAssist: String = "",
-        val input: String = "",
-        val send: String = "",
+        val wake: String = "",
+        val screenMode: String = "",
+        val ask: String = "",
         val read: String = "",
         val answer: String = "",
+        val hint: String = "",
         val finishedAt: Long = System.currentTimeMillis()
     ) {
         fun summary(): String = buildString {
             append(title).append('\n')
-            if (wakeGesture.isNotEmpty()) append(wakeGesture).append('\n')
-            if (wakeAssist.isNotEmpty()) append(wakeAssist).append('\n')
-            if (input.isNotEmpty()) append(input).append('\n')
-            if (send.isNotEmpty()) append(send).append('\n')
+            if (wake.isNotEmpty()) append(wake).append('\n')
+            if (screenMode.isNotEmpty()) append(screenMode).append('\n')
+            if (ask.isNotEmpty()) append(ask).append('\n')
             if (read.isNotEmpty()) append(read).append('\n')
+            if (hint.isNotEmpty()) append("\n").append(hint).append('\n')
             if (answer.isNotEmpty()) {
                 append("\n──── YOYO 的回答 ────\n").append(answer)
             }
         }
     }
 
-    private const val QUESTION = "请直接回答：图中这道题选哪个选项？只回答选项字母，比如 A 或 B。"
+    private const val MAGIC_WORD = "问屏"
+    private const val QUESTION = "这道题选哪个选项？只回答选项字母。"
 
     /**
-     * 跑一次完整实验。必须在无障碍服务里调用（要用到 dispatchGesture / takeScreenshot / 节点写入）。
+     * 跑一次完整实验。必须在无障碍服务里调用。
      * 结果通过 [onTrace] 回传，调用方负责显示到答案卡。
      */
     suspend fun run(
@@ -69,88 +73,82 @@ object YoyoLab {
         onTrace(t)
         cfg.appendLog("[YOYO实验] 开始")
 
-        // ---------- 第 0 步：记下唤起前的屏幕指纹，用于判断唤出有没有生效 ----------
-        val before = if (ScreenshotOcr.supported) {
+        // 记下唤起前的屏幕文字，读回时用来排除题面本身
+        val beforeText = if (ScreenshotOcr.supported) {
             ScreenshotOcr.grabScaled(service)?.let { bmp ->
-                val sig = ScreenshotOcr.signature(bmp)
-                val lines = ScreenshotOcr.recognizeLines(bmp).joinToString(" ") { it.text }
+                val s = ScreenshotOcr.recognizeLines(bmp).joinToString(" ") { it.text }
                 bmp.recycle()
-                Pair(sig, lines)
+                s
             }
-        } else null
+        } else "" ?: ""
 
-        // ---------- 第 1 步 A：模拟长按小白条 ----------
-        val dm = service.resources.displayMetrics
-        val cx = dm.widthPixels / 2f
-        // 小白条在最底部；留 8px 余量，落在导航手势区里
-        val bottomY = dm.heightPixels - 8f
-        val gestureOk = longPress(service, cx, bottomY)
-        t = t.copy(wakeGesture = "① 长按小白条手势：${if (gestureOk) "已注入" else "被系统拒绝"}")
+        // ---------- ① 唤醒：ACTION_ASSIST（等价于电源键唤醒 YOYO）----------
+        val wakeOk = fireAssist(service)
+        var wakeDetail = "① 唤醒YOYO(助手意图)：${if (wakeOk) "已发出" else "无响应"}"
+        t = t.copy(wake = wakeDetail)
         onTrace(t)
+        delay(2000)
 
-        delay(1400)
-
-        // ---------- 判断唤出有没有生效（截图变化 or 出现 YOYO 字样）----------
-        var awake = false
-        if (before != null && ScreenshotOcr.supported) {
-            val after = ScreenshotOcr.grabScaled(service)?.let { bmp ->
-                val sig = ScreenshotOcr.signature(bmp)
-                val lines = ScreenshotOcr.recognizeLines(bmp).joinToString(" ") { it.text }
-                bmp.recycle()
-                Pair(sig, lines)
-            }
-            if (after != null) {
-                val changed = after.first != before.first
-                val hasYoyo = after.second.contains("YOYO", ignoreCase = true) ||
-                              after.second.contains("悠悠") ||
-                              after.second.contains("问我")
-                awake = changed || hasYoyo
-                t = t.copy(wakeGesture = t.wakeGesture +
-                    " · 屏幕${if (changed) "变了" else "没变"}${if (hasYoyo) " · 见到YOYO字样" else ""}")
-                onTrace(t)
-            }
-        }
-
-        // ---------- 第 1 步 B：ACTION_ASSIST 意图（长按如果没唤出，补这一路）----------
-        if (!awake) {
-            val assistOk = fireAssist(service)
-            t = t.copy(wakeAssist = "② 系统助手意图：${if (assistOk) "已发出" else "无应用响应"}")
+        // 助手意图没反应的话，再试一次「双指按压」问屏手势（官方推荐入口，但无障碍不一定能注入）
+        if (!wakeOk) {
+            val twoOk = twoFingerPress(service)
+            wakeDetail += " · 双指按压问屏：${if (twoOk) "手势已注入" else "被系统拒绝"}"
+            t = t.copy(wake = wakeDetail)
             onTrace(t)
             delay(1800)
-        } else {
-            t = t.copy(wakeAssist = "② 系统助手意图：跳过（长按已生效）")
-            onTrace(t)
         }
 
-        // ---------- 第 2 步：找输入框写问题 ----------
-        val root = service.rootInActiveWindow
-        val inputNode = root?.let { findEditable(it) }
-        val wrote = inputNode?.let { setText(it, QUESTION) } ?: false
-        t = t.copy(input = "③ 输入框：${when {
-            inputNode == null -> "没找到（YOYO 输入可能不是标准EditText）"
-            wrote -> "已写入问题"
-            else -> "找到了但写入被拒"
-        }}")
-        onTrace(t)
-        inputNode?.recycle()
+        // 唤醒后，找输入框。YOYO 面板的输入框通常是可编辑节点。
+        var root = service.rootInActiveWindow
+        var inputNode = root?.let { findEditable(it) }
 
-        // ---------- 第 3 步：找发送按钮 ----------
-        val root2 = service.rootInActiveWindow
-        val sendNode = root2?.let { findSendButton(it) }
-        val sent = sendNode?.let { it.performAction(AccessibilityNodeInfo.ACTION_CLICK) } ?: false
-        t = t.copy(send = "④ 发送：${when {
-            sendNode == null -> "没找到发送按钮（可尝试回车，实验版暂未注入）"
-            sent -> "已点发送"
-            else -> "找到了但点击失败"
-        }}")
+        if (inputNode == null) {
+            // 输入框找不到时，尝试截屏「问YOYO」这条路行不通（那是系统截图弹窗），
+            // 这里明确记录失败点，便于判断是不是压根没唤醒。
+            t = t.copy(
+                screenMode = "② 问屏：没找到输入框——可能没唤醒成功，或YOYO输入不是标准控件",
+                hint = "提示：请先在系统里开启「荣耀AI&YOYO > YOYO智能体 > YOYO问屏」开关，" +
+                       "并确认YOYO版本支持（MagicOS 9.0+）。双指按压识屏无障碍无法可靠注入。"
+            )
+            onTrace(t)
+            root?.recycle()
+            finishEmpty(t, cfg, onTrace)
+            return
+        }
+
+        // ---------- ② 输入「问屏」进入识屏模式 ----------
+        val wroteMagic = setText(inputNode, MAGIC_WORD)
+        val sentMagic = wroteMagic && clickSend(service)
+        t = t.copy(screenMode = "② 输入「问屏」：${if (wroteMagic) "已写入" else "写入被拒"} / " +
+                                  "发送：${if (sentMagic) "成功" else "失败或没找到发送键"}")
         onTrace(t)
-        sendNode?.recycle()
+        inputNode.recycle()
         root?.recycle()
-        root2?.recycle()
+        delay(2500)
 
-        // ---------- 第 4 步：连续截图 OCR 等回答稳定 ----------
-        val answer = if (ScreenshotOcr.supported) waitAndRead(service, cfg, before?.second.orEmpty(), onTrace, t) else {
-            t = t.copy(read = "⑤ 读回：系统版本过低，无截图接口")
+        // ---------- ③ 再输入题目问题并发送 ----------
+        root = service.rootInActiveWindow
+        inputNode = root?.let { findEditable(it) }
+        if (inputNode == null) {
+            t = t.copy(ask = "③ 问题目：问屏后找不到输入框（界面可能已切换到识屏视图）")
+            onTrace(t)
+            root?.recycle()
+            finishEmpty(t, cfg, onTrace)
+            return
+        }
+        val wroteQ = setText(inputNode, QUESTION)
+        val sentQ = wroteQ && clickSend(service)
+        t = t.copy(ask = "③ 问题目：${if (wroteQ) "已写入" else "写入被拒"} / " +
+                          "发送：${if (sentQ) "成功" else "失败或没找到发送键"}")
+        onTrace(t)
+        inputNode.recycle()
+        root?.recycle()
+
+        // ---------- ④ 连续截图 OCR 读回 ----------
+        val answer = if (ScreenshotOcr.supported) {
+            waitAndRead(service, cfg, beforeText, onTrace, t)
+        } else {
+            t = t.copy(read = "④ 读回：系统版本过低，无截图接口")
             onTrace(t)
             ""
         }
@@ -163,16 +161,38 @@ object YoyoLab {
         cfg.appendLog("[YOYO实验] 结束，读回 ${answer.length} 字")
     }
 
-    /** 长按手势：按住 bottomY 620ms 再松开。true=系统回调 onCompleted（手势跑完）。 */
-    private suspend fun longPress(service: AccessibilityService, x: Float, y: Float): Boolean {
+    private fun finishEmpty(t: Trace, cfg: ConfigStore, onTrace: (Trace) -> Unit) {
+        val done = t.copy(
+            title = "◈ YOYO 实验 · 中断",
+            answer = "（在某一步卡住了，没走到读回答。按上面的提示检查设置后重试）"
+        )
+        onTrace(done)
+        cfg.appendLog("[YOYO实验] 中断")
+    }
+
+    /** 发系统助手意图，尝试唤醒 YOYO（等价于电源键唤醒的路径）。 */
+    private fun fireAssist(service: Context): Boolean = runCatching {
+        val i = Intent(Intent.ACTION_ASSIST).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        service.startActivity(i)
+        true
+    }.getOrDefault(false)
+
+    /**
+     * 模拟双指按压（问屏手势）——留作诊断，不一定被系统接受。
+     * 两条同时按下的 stroke，坐标在屏幕中部。
+     */
+    private suspend fun twoFingerPress(service: AccessibilityService): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
-        val path = Path().apply { moveTo(x, y) }
-        val stroke = android.accessibilityservice.GestureDescription.StrokeDescription(path, 0L, 620L)
+        val dm = service.resources.displayMetrics
+        val cx = dm.widthPixels / 2f
+        val cy = dm.heightPixels / 2f
+        val p1 = Path().apply { moveTo(cx - 60f, cy) }
+        val p2 = Path().apply { moveTo(cx + 60f, cy) }
         val gesture = android.accessibilityservice.GestureDescription.Builder()
-            .addStroke(stroke).build()
-        // 关键：dispatchGesture 返回 true 只代表"手势已排队"，真正成功与否看 callback。
-        // 用 2 秒超时兜住回调不来的情况，避免实验永久卡死。
-        return withTimeoutOrNull(2000L) {
+            .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(p1, 0L, 500L))
+            .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(p2, 0L, 500L))
+            .build()
+        return withTimeoutOrNull(1500L) {
             suspendCancellableCoroutine<Boolean> { cont ->
                 val cb = object : AccessibilityService.GestureResultCallback() {
                     override fun onCompleted(g: android.accessibilityservice.GestureDescription?) {
@@ -188,55 +208,52 @@ object YoyoLab {
         } ?: false
     }
 
-    /** 发系统助手意图，尝试唤出 YOYO。 */
-    private fun fireAssist(service: Context): Boolean = runCatching {
-        val i = Intent(Intent.ACTION_ASSIST).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        service.startActivity(i)
-        true
-    }.getOrDefault(false)
-
     /** 遍历节点树找可编辑输入框。 */
     private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        var fallback: AccessibilityNodeInfo? = null
+        var found: AccessibilityNodeInfo? = null
         while (queue.isNotEmpty()) {
             val n = queue.removeFirstOrNull() ?: break
-            if (!n.isVisibleToUser) { recycleChildren(n); continue }
-            val cls = n.className?.toString().orEmpty()
-            if (n.isEditable || cls.contains("EditText") || cls.contains("InputField")) {
-                fallback = n
-                break
-            }
-            for (i in 0 until n.childCount) {
-                runCatching { n.getChild(i) }?.let { queue.add(it) }
+            if (n.isVisibleToUser) {
+                val cls = n.className?.toString().orEmpty()
+                if (n.isEditable || cls.contains("EditText") || cls.contains("InputField")) {
+                    found = n
+                    break
+                }
+                for (i in 0 until n.childCount) {
+                    val child = runCatching { n.getChild(i) }.getOrNull()
+                    if (child != null) queue.add(child)
+                }
             }
         }
-        // 回收没进结果队列的其余节点（简化：只回收 fallback 之外的首层已取子节点）
-        return fallback
+        return found
     }
 
-    /** 找发送按钮：文字/描述含"发送/回车/send/➤"，且可点击。 */
-    private fun findSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+    /** 找发送按钮：文字/描述含 发送/send/➤/提交，且可点击；找不到就用回车手势兜底。 */
+    private fun clickSend(service: AccessibilityService): Boolean {
+        val root = service.rootInActiveWindow ?: return false
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        val keys = listOf("发送", "send", "➤", "➜", "提交", "完成")
+        val keys = listOf("发送", "send", "➤", "➜", "提交", "完成", "搜索")
+        var target: AccessibilityNodeInfo? = null
         while (queue.isNotEmpty()) {
             val n = queue.removeFirstOrNull() ?: break
-            if (!n.isVisibleToUser) { recycleChildren(n); continue }
-            val text = (n.text?.toString().orEmpty() + " " + n.contentDescription?.toString().orEmpty()).lowercase()
-            if (n.isClickable && keys.any { text.contains(it.lowercase()) }) return n
-            for (i in 0 until n.childCount) {
-                runCatching { n.getChild(i) }?.let { queue.add(it) }
+            if (n.isVisibleToUser) {
+                val text = (n.text?.toString().orEmpty() + " " + n.contentDescription?.toString().orEmpty()).lowercase()
+                if (n.isClickable && keys.any { text.contains(it.lowercase()) }) {
+                    target = n
+                    break
+                }
+                for (i in 0 until n.childCount) {
+                    val child = runCatching { n.getChild(i) }.getOrNull()
+                    if (child != null) queue.add(child)
+                }
             }
         }
-        return null
-    }
-
-    private fun recycleChildren(n: AccessibilityNodeInfo) {
-        for (i in 0 until n.childCount) {
-            runCatching { n.getChild(i)?.recycle() }
-        }
+        val clicked = target?.let { it.performAction(AccessibilityNodeInfo.ACTION_CLICK) } ?: false
+        root.recycle()
+        return clicked
     }
 
     /** 往节点写文本（无障碍标准接口）。 */
@@ -276,7 +293,7 @@ object YoyoLab {
             }.joinToString("\n")
 
             if (fresh.length > best.length) best = fresh
-            t = t.copy(read = "⑤ 读回第 $round/5 轮 · 新增 ${fresh.length} 字")
+            t = t.copy(read = "④ 读回第 $round/5 轮 · 新增 ${fresh.length} 字")
             onTrace(t)
             if (fresh.length > 40) break
         }

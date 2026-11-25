@@ -286,14 +286,13 @@ class ScreenReadService : AccessibilityService() {
         scope.launch {
             try {
                 YoyoLab.run(this@ScreenReadService, cfg) { trace ->
-                    withContext(Dispatchers.Main) {
-                        AnswerOverlay.show(
-                            this@ScreenReadService,
-                            trace.summary(),
-                            allowAutoClick = false,
-                            onAutoClick = { "" }
-                        )
-                    }
+                    // AnswerOverlay.show 内部已用 main.post 切主线程，这里直接调用即可。
+                    AnswerOverlay.show(
+                        this@ScreenReadService,
+                        trace.summary(),
+                        allowAutoClick = false,
+                        onAutoClick = { "" }
+                    )
                 }
             } finally {
                 busy = false
