@@ -772,12 +772,14 @@ class ScreenReadService : AccessibilityService() {
                     lastClickedFp = fp
                     // 点完页面通常有奖励动画，别在这 1.2 秒里把同一题再问一遍
                     lastAskAt = System.currentTimeMillis() + 1200
-                    // 答完顺手把「下一题/继续/知道了」按掉：这类按钮是确定性的，
+                    // 答完顺手做两段收尾：先提交作答、再下一题/关闭。这类按钮文字是固定的，
                     // 交给脚本而不是再问一次模型（晨钟酱那套"手归脚本、脑归模型"的分工）。
                     val adv = runCatching { tryAdvance(answer) }.getOrNull()
                     if (adv != null) {
-                        cfg.appendLog("[推进] 顺手点了「$adv」，接着看下一题")
+                        cfg.appendLog("[收尾] 已按：$adv（接着看下一题）")
                         lastAskAt = System.currentTimeMillis() + 1600
+                    } else {
+                        cfg.appendLog("[收尾] 没找到收尾按钮——若本题需点「提交作答」才能进下一题，请把该按钮文字发我")
                     }
                 } else {
                     if (msg.contains("漏选"))
@@ -830,6 +832,12 @@ class ScreenReadService : AccessibilityService() {
 
         val before = runCatching { ScreenshotOcr.grabScaled(this@ScreenReadService) }.getOrNull()
         val sigBefore = before?.let { ScreenshotOcr.signature(it, ownOverlayRects(it)) } ?: ""
+        // 每个落点各自的局部基准，点完先比局部（能抓到"圆圈变绿"），再比整屏
+        val localBeforeByTarget = HashMap<TapTarget, String>()
+        ladder.forEach { t ->
+            val lb = before?.let { localSigOf(it, t.x, t.y) } ?: ""
+            localBeforeByTarget[t] = lb
+        }
         before?.recycle()
 
         // 阶梯重试：先点最可信的落点，两次都推不动页面才换下一个策略。
@@ -852,16 +860,20 @@ class ScreenReadService : AccessibilityService() {
             cfg.appendLog("[操控] 已点选 ${digest(target.label)} @ (${target.x.toInt()}, ${target.y.toInt()})")
 
             delay(TAP_VERIFY_DELAY_MS)
-            var changed = screenChanged(sigBefore)
+            val lb = localBeforeByTarget[target].orEmpty()
+            // 局部优先：选项圆圈由空心变绿，整屏 aHash 常常采不到，但局部一定看得见。
+            var changed = localChanged(lb, target.x, target.y) || screenChanged(sigBefore)
 
-            // 同一个点再戳一次：不改变选择，只是有些 H5 控件要两次真实触摸才响应
+            // 只有整屏和局部都没反应才补点。旧版只看整屏，导致"明明选上了"还再戳一下，
+            // 结果把刚选中的又取消了 —— 这正是截图里"点中了却停在本题"的根因。
             if (!changed) {
-                cfg.appendLog("[操控] 页面没变化，改用真实触摸原地补点")
+                cfg.appendLog("[操控] 整屏与局部都无变化，改用真实触摸原地补点")
                 tapAt(target.x, target.y)
                 delay(700)
-                changed = screenChanged(sigBefore)
+                changed = localChanged(lb, target.x, target.y) || screenChanged(sigBefore)
             }
             if (changed) {
+                cfg.appendLog("[操控] 局部/整屏已确认变化，认定点中，不再补点")
                 hit = target
                 break
             }
@@ -934,6 +946,7 @@ class ScreenReadService : AccessibilityService() {
 
             val before = runCatching { ScreenshotOcr.grabScaled(this@ScreenReadService) }.getOrNull()
             val sigBefore = before?.let { ScreenshotOcr.signature(it, ownOverlayRects(it)) } ?: ""
+            val localBefore = before?.let { localSigOf(it, target.x, target.y) } ?: ""
             before?.recycle()
 
             // 选项被答案卡挡住就先收卡，保证能点到
@@ -948,11 +961,13 @@ class ScreenReadService : AccessibilityService() {
                 continue
             }
             delay(TAP_VERIFY_DELAY_MS)
-            var changed = if (sigBefore.isEmpty()) true else screenChanged(sigBefore)
+            var changed = localChanged(localBefore, target.x, target.y) ||
+                (if (sigBefore.isEmpty()) true else screenChanged(sigBefore))
             if (!changed) {
                 tapAt(target.x, target.y)   // H5 控件常要真实触摸补一下
                 delay(650)
-                changed = if (sigBefore.isEmpty()) true else screenChanged(sigBefore)
+                changed = localChanged(localBefore, target.x, target.y) ||
+                    (if (sigBefore.isEmpty()) true else screenChanged(sigBefore))
             }
             if (changed) {
                 ok.add(letter)
@@ -982,6 +997,28 @@ class ScreenReadService : AccessibilityService() {
         val sig = runCatching { ScreenshotOcr.signature(bmp, ownOverlayRects(bmp)) }.getOrDefault("")
         bmp.recycle()
         return sig.isNotEmpty() && sig != sigBefore
+    }
+
+    /**
+     * 屏幕坐标 → 局部签名。只取落点周围一小块，专门抓"选项圆圈由空心变绿"这种
+     * 全屏 aHash 采不到的局部变化。截图是缩放过的，先按比例换算到截图坐标。
+     */
+    private fun localSigOf(bmp: android.graphics.Bitmap, screenX: Float, screenY: Float): String {
+        if (lastShotW <= 0 || lastShotH <= 0) return ""
+        val dm = resources.displayMetrics
+        val ix = screenX * lastShotW / dm.widthPixels
+        val iy = screenY * lastShotH / dm.heightPixels
+        return ScreenshotOcr.localSignature(bmp, ix, iy)
+    }
+
+    /** 再截一屏，比较落点周围那一小块有没有变化。 */
+    private suspend fun localChanged(localBefore: String, screenX: Float, screenY: Float): Boolean {
+        if (localBefore.isEmpty()) return false
+        val bmp = runCatching { ScreenshotOcr.grabScaled(this@ScreenReadService) }.getOrNull()
+            ?: return false
+        val sig = localSigOf(bmp, screenX, screenY)
+        bmp.recycle()
+        return sig.isNotEmpty() && sig != localBefore
     }
 
     /**
@@ -1126,30 +1163,95 @@ class ScreenReadService : AccessibilityService() {
         return out
     }
 
-    /** 答完题后常见的推进按钮：确定性的活儿交给脚本，不必再问一次模型。 */
     /**
-     * 只收"导航语义"的词。泛化的「确定 / 好的 / 领取」被移出：
-     * 支付确认、权限申请、系统弹窗上也叫这几个字，自动点掉的风险远大于收益（审查 M-3）。
+     * 答完题后的"收尾按钮"词表，按语义强度分两段。
+     *
+     * 背景：题库有两种收尾方式——
+     *  A. 点完选项就自动跳（无需收尾）；
+     *  B. 点完要先按「提交作答」，再按「下一题 / 关闭」才推进（截图就是这种）。
+     * 旧版只认 B 的后半段，且词表里没有"提交作答/关闭"，于是答完卡在本题。
+     *
+     * 分层理由（安全权衡）：
+     *  - 强词：只可能出现在答题页，直接点；
+     *  - 弱词：「关闭/完成/确定」在广告弹窗、系统对话框里也常见，
+     *    只在第一段确实点过提交、且有答题上下文时才作为第二段点一次（审查 M-3 的教训）。
      */
-    private val ADVANCE_WORDS = listOf(
-        "下一题", "下一关", "继续答题", "继续", "再来一题", "再来一次",
-        "我知道了", "知道了", "开心收下", "领取奖励"
+    /** 第一段：把答案交上去。这些词几乎只出现在答题场景，安全。 */
+    private val SUBMIT_WORDS = listOf(
+        "提交作答", "提交答案", "提交", "交卷", "确认答案", "确认提交", "完成答题"
     )
 
+    /** 第二段：从结果页进入下一题。这些是导航语义，安全。 */
+    private val ADVANCE_WORDS = listOf(
+        "下一题", "下一关", "继续答题", "继续", "再来一题", "再来一次",
+        "我知道了", "知道了", "开心收下", "领取奖励", "查看下一题"
+    )
+
+    /** 弱语义词：仅在"本轮刚提交过 + 屏幕上还有答题痕迹"时才允许点一次。 */
+    private val WEAK_CLOSE_WORDS = listOf("关闭", "完成", "确定", "好的")
+
+    /** 一个收尾按钮候选：标签 + 屏幕坐标（节点点击或手势点击二选一）。 */
+    private class FinalBtn(val label: String, val x: Float, val y: Float, val node: AccessibilityNodeInfo?)
+
     /**
-     * 答对之后把「下一题 / 继续 / 知道了」按掉一次。
+     * 两段式收尾：先提交，再推进。
      *
-     * 为什么值得单独写：活动答题页每答一题都会弹一个奖励层，不点掉就永远停在那一屏，
-     * 表现成"识别到题、也点中了，但就是不动了"。这类按钮文字是固定的，
-     * 用白名单直接点比再花一次模型调用稳得多，也快得多。
-     * 只点一次、且答案本身不是这个词，避免连环误点。
+     * @return 实际点掉的按钮文字（供日志/回显），没点到返回 null。
      */
     private suspend fun tryAdvance(answer: String): String? {
-        delay(850)   // 等奖励弹窗/动效真正出来
-        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return null
-        var found: AccessibilityNodeInfo? = null
-        var label = ""
+        delay(700)   // 等选中高亮/结果层真正出来，别抢在动画前点
+        var clicked: String? = null
 
+        // ---------- 第一段：提交 ----------
+        val submitBtn = findFinalButton(SUBMIT_WORDS, answer)
+        if (submitBtn != null) {
+            val ok = tapFinalButton(submitBtn)
+            if (ok) {
+                clicked = submitBtn.label
+                cfg.appendLog("[收尾] 第一段：已点「${submitBtn.label}」提交作答")
+                lastAskAt = System.currentTimeMillis() + 1000
+                delay(900)   // 等提交后的结果层/下一题按钮出现
+            }
+        }
+
+        // ---------- 第二段：推进 ----------
+        // 弱词闸门：只有第一段确实提交了、且当前屏还看得到答题痕迹，才放开 WEAK_CLOSE_WORDS。
+        val allowWeak = clicked != null && hasAnswerContext()
+        val strong = findFinalButton(ADVANCE_WORDS, answer)
+        val weak = if (allowWeak) findFinalButton(WEAK_CLOSE_WORDS, answer) else null
+        val next = strong ?: weak
+        if (next != null && tapFinalButton(next)) {
+            cfg.appendLog("[收尾] 第二段：已点「${next.label}」进入下一题")
+            clicked = clicked?.let { "$it → ${next.label}" } ?: next.label
+            lastAskAt = System.currentTimeMillis() + 1500
+        }
+        return clicked
+    }
+
+    /** 当前屏是否还有"这是答题页"的证据（题干判题词 / 至少两个选项字母）。 */
+    private fun hasAnswerContext(): Boolean {
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return false
+        val labels = collectShortLabels(root).map { normalize(it.text) }
+        val letters = labels.count { it.length == 1 && it[0] in 'a'..'d' }
+        return letters >= 2 || labels.any { STRONG_WORDS.any { w -> it.contains(normalize(w)) } }
+    }
+
+    /**
+     * 在节点树里找收尾按钮，找不到再用 OCR 兜底（H5 题库按钮文字画在 Canvas 上）。
+     * 危险控件黑名单与"答案本身即该词"的排除都在这里做。
+     */
+    private fun findFinalButton(words: List<String>, answer: String): FinalBtn? {
+        val root = runCatching { rootInActiveWindow }.getOrNull()
+        var found: FinalBtn? = null
+        fun match(t: String): Boolean {
+            if (t.isEmpty() || t.length > 8) return false
+            val n = normalize(t)
+            if (words.none { n == normalize(it) }) return false
+            if (isDangerousLabel(t)) return false
+            // 极端情况：正确选项的文字恰好就是"提交"这类词，别把选项当按钮
+            if (candidates(answer).any { normalize(it) == n }) return false
+            return true
+        }
         fun walk(n: AccessibilityNodeInfo?, depth: Int) {
             if (n == null || depth > 30 || found != null) return
             val t = runCatching {
@@ -1157,25 +1259,35 @@ class ScreenReadService : AccessibilityService() {
                     n.contentDescription?.toString()?.trim().orEmpty()
                 }
             }.getOrDefault("")
-            if (t.isNotEmpty() && t.length <= 8 && t in ADVANCE_WORDS && isOnScreen(n)) {
+            if (match(t) && isOnScreen(n)) {
+                val r = Rect()
+                runCatching { n.getBoundsInScreen(r) }
                 val clickable = if (n.isClickable) n
                 else runCatching { n.parent }.getOrNull()?.takeIf { it.isClickable }
-                found = clickable ?: n
-                label = t
+                found = FinalBtn(t, r.exactCenterX(), r.exactCenterY(), clickable ?: n)
                 return
             }
             for (i in 0 until n.childCount) {
                 walk(runCatching { n.getChild(i) }.getOrNull(), depth + 1)
             }
         }
-        walk(root, 0)
+        if (root != null) walk(root, 0)
+        if (found != null) return found
 
-        val node = found ?: return null
-        // 答案本身就叫「确定」这种极端情况：别把选项当推进按钮
-        if (candidates(answer).any { normalize(it) == normalize(label) }) return null
+        // OCR 兜底：节点拿不到文字的 H5/WebView 按钮
+        for (line in lastOcrLines) {
+            if (!match(line.text)) continue
+            val p = imageToScreen(line.cx, line.cy) ?: continue
+            found = FinalBtn(line.text, p.first, p.second, null)
+            break
+        }
+        return found
+    }
 
-        val ok = if (node.isClickable) clickNode(node) else tapByGesture(node)
-        return if (ok) label else null
+    private suspend fun tapFinalButton(btn: FinalBtn): Boolean {
+        val ok = if (btn.node != null) clickNode(btn.node) else tapAt(btn.x, btn.y)
+        if (!ok && btn.node != null) return tapAt(btn.x, btn.y)
+        return ok
     }
 
     /**

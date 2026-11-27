@@ -149,6 +149,33 @@ object ScreenshotOcr {
     }
 
     /**
+     * 局部签名：只取 (cx,cy) 周围一小块算指纹，用来确认"点这一下有没有反应"。
+     *
+     * 为什么需要它：全屏 32×32 的 aHash 把整屏亮度平均掉，选项圆圈从空心变绿色
+     * 只占几个采样点，签名常常纹丝不动 —— 于是"明明点中了"却报"页面没变化"，
+     * 还会触发同点补点把刚选中的又取消掉。局部块里那一下变色占比大，立刻可见。
+     *
+     * [cx]/[cy] 是**截图坐标**（不是屏幕坐标），由调用方按比例换算后传入。
+     * [half] 是半径像素，默认取截图的 9% 左右，足够盖住一个选项行。
+     */
+    fun localSignature(bmp: Bitmap, cx: Float, cy: Float, half: Int = 0): String {
+        val w = bmp.width
+        val h = bmp.height
+        if (w <= 0 || h <= 0) return ""
+        val r = if (half > 0) half else (minOf(w, h) * 0.09f).toInt().coerceAtLeast(24)
+        val l = (cx - r).toInt().coerceAtLeast(0)
+        val t = (cy - r).toInt().coerceAtLeast(0)
+        val rr = (cx + r).toInt().coerceAtMost(w - 1)
+        val bb = (cy + r).toInt().coerceAtMost(h - 1)
+        if (rr - l < 8 || bb - t < 8) return ""
+        val crop = runCatching { Bitmap.createBitmap(bmp, l, t, rr - l, bb - t) }.getOrNull()
+            ?: return ""
+        val sig = runCatching { signature(crop) }.getOrDefault("")
+        crop.recycle()
+        return sig
+    }
+
+    /**
      * Set-of-Mark：给每行字编个号，画在它旁边（左侧空隙，压不到字）。
      *
      * 这是 AppAgent / Mobile-Agent 那一派的通行做法：让视觉模型"选几号"，
